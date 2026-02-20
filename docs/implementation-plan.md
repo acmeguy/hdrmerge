@@ -785,9 +785,9 @@ Fill in after each step. Steps 0-9 should produce bit-identical output. Steps 10
 
 | Step | Description | Set A time | Set A size | Set B time | Set B size | Set C time | Set C size | Identical to prev |
 |------|-------------|-----------|-----------|-----------|-----------|-----------|-----------|-------------------|
-| 0 | Baseline | | | | | | | vs org/ |
-| 1 | zlib-ng | | | | | | | |
-| 2 | LibRaw upgrade | | | | | | | |
+| 0 | Baseline | 5.86s | 117,113,806 | 6.53s | 106,710,316 | 6.32s | 129,106,446 | byte-identical to org/ |
+| 1 | zlib-ng 2.3.3 | 5.51s | 116,870,558 | 6.16s | 106,320,644 | 6.27s | 128,617,186 | pixel-identical (timestamp + compressed bytes differ) |
+| 2 | LibRaw 0.21.4 | — | — | — | — | — | — | no change (already >= 0.21.3) |
 | 3 | libdeflate | | | | | | | pixel-identical |
 | 4 | Byte-shuffle | | | | | | | pixel-identical |
 | 5 | Compression level | | | | | | | |
@@ -864,12 +864,12 @@ Every actionable finding from `research-modern-hdr-techniques.md` is mapped belo
 | Section 2 | Sigma-clipping ghost detection | Step 13 | Planned |
 | Section 3 | Sub-pixel phase correlation | Step 10 | Planned |
 | Section 3 | Feature-based alignment (ORB/AKAZE) | Step 11 | Planned |
-| Section 4 | zlib-ng drop-in | Step 1 | Planned |
+| Section 4 | zlib-ng drop-in | Step 1 | **Done** (2dc75eb) |
 | Section 4 | libdeflate integration | Step 3 | Planned |
 | Section 4 | Byte-shuffle preprocessing | Step 4 | Planned |
 | Section 4 | Configurable compression level | Step 5 | Planned |
 | Section 5 | DNG 1.7 / JPEG XL | Step 15 | Deferred (ecosystem) |
-| Section 6 | LibRaw upgrade | Step 2 | Planned |
+| Section 6 | LibRaw upgrade | Step 2 | **Done** (0.21.4 verified) |
 | Section 7 | NEON fattenMask | Step 6 | Planned |
 | Section 7 | NEON float-to-half | Step 7 | Planned |
 | Section 7 | NEON box blur | Step 8 | Planned |
