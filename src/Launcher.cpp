@@ -23,10 +23,16 @@
 #include <iostream>
 #include <iomanip>
 #include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
 #include <QApplication>
 #include <QTranslator>
 #include <QLibraryInfo>
 #include <QLocale>
+#include <QDir>
+#include <QFileInfo>
 #include "Launcher.hpp"
 #include "ImageIO.hpp"
 #ifndef NO_GUI
@@ -34,12 +40,33 @@
 #endif
 #include "Log.hpp"
 #include <libraw.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace std;
 
 namespace hdrmerge {
 
-Launcher::Launcher(int argc, char * argv[]) : argc(argc), argv(argv), help(false) {
+static const QStringList rawExtensions = {
+    "*.nef", "*.cr2", "*.cr3", "*.arw", "*.dng", "*.raf", "*.orf", "*.rw2",
+    "*.pef", "*.srw", "*.3fr", "*.mrw", "*.raw", "*.sr2", "*.mef", "*.nrw"
+};
+
+static void scanDirectory(const QString & path, std::vector<QString> & fileNames) {
+    QDir dir(path);
+    if (!dir.exists()) {
+        cerr << "Directory does not exist: " << path << endl;
+        return;
+    }
+    QFileInfoList entries = dir.entryInfoList(rawExtensions, QDir::Files, QDir::Name);
+    for (const QFileInfo & entry : entries) {
+        fileNames.push_back(entry.absoluteFilePath());
+    }
+    Log::debug("Found ", entries.size(), " raw files in ", path);
+}
+
+Launcher::Launcher(int argc, char * argv[]) : argc(argc), argv(argv), help(false), maxJobs(0) {
     Log::setOutputStream(cout);
     saveOptions.previewSize = 2;
 }
@@ -115,41 +142,130 @@ int Launcher::automaticMerge() {
     } else {
         optionsSet.push_back(generalOptions);
     }
-    ImageIO io;
-    int result = 0;
+
+    auto startTime = std::chrono::steady_clock::now();
+
+    // For a single set, run sequentially (no thread overhead)
+    if (optionsSet.size() <= 1) {
+        ImageIO io;
+        int result = 0;
+        for (LoadOptions & options : optionsSet) {
+            if (!options.withSingles && options.fileNames.size() == 1) {
+                Log::progress(tr("Skipping single image %1").arg(options.fileNames.front()));
+                continue;
+            }
+            CoutProgressIndicator progress;
+            int numImages = options.fileNames.size();
+            int loadResult = io.load(options, progress);
+            if (loadResult < numImages * 2) {
+                int format = loadResult & 1;
+                int i = loadResult >> 1;
+                if (format) {
+                    cerr << tr("Error loading %1, it has a different format.").arg(options.fileNames[i]) << endl;
+                } else {
+                    cerr << tr("Error loading %1, file not found.").arg(options.fileNames[i]) << endl;
+                }
+                result = 1;
+                continue;
+            }
+            SaveOptions setOptions = saveOptions;
+            if (!setOptions.fileName.isEmpty()) {
+                setOptions.fileName = io.replaceArguments(setOptions.fileName, "");
+                int extPos = setOptions.fileName.lastIndexOf('.');
+                if (extPos > setOptions.fileName.length() || setOptions.fileName.mid(extPos) != ".dng") {
+                    setOptions.fileName += ".dng";
+                }
+            } else {
+                setOptions.fileName = io.buildOutputFileName();
+            }
+            Log::progress(tr("Writing result to %1").arg(setOptions.fileName));
+            io.save(setOptions, progress);
+        }
+        double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+        Log::progress("Total processing time: ", elapsed, " seconds");
+        return result;
+    }
+
+    // Multiple sets: run concurrently
+    Log::progress("Processing ", optionsSet.size(), " sets with up to ", maxJobs, " concurrent jobs");
+
+#ifdef _OPENMP
+    int totalOmpThreads = omp_get_max_threads();
+    int ompPerJob = std::max(1, totalOmpThreads / maxJobs);
+    Log::debug("OpenMP threads per job: ", ompPerJob, " (total: ", totalOmpThreads, ")");
+#endif
+
+    std::atomic<int> globalResult(0);
+    std::vector<std::thread> threads;
+    std::mutex jobMutex;
+    std::condition_variable jobCv;
+    std::atomic<int> activeJobs(0);
+
     for (LoadOptions & options : optionsSet) {
         if (!options.withSingles && options.fileNames.size() == 1) {
             Log::progress(tr("Skipping single image %1").arg(options.fileNames.front()));
             continue;
         }
-        CoutProgressIndicator progress;
-        int numImages = options.fileNames.size();
-        int result = io.load(options, progress);
-        if (result < numImages * 2) {
-            int format = result & 1;
-            int i = result >> 1;
-            if (format) {
-                cerr << tr("Error loading %1, it has a different format.").arg(options.fileNames[i]) << endl;
+
+        // Wait if at max capacity
+        {
+            std::unique_lock<std::mutex> lock(jobMutex);
+            jobCv.wait(lock, [&]{ return activeJobs.load() < maxJobs; });
+            activeJobs++;
+        }
+
+        // Capture by value for the thread
+        LoadOptions threadOptions = options;
+        SaveOptions threadSaveOptions = saveOptions;
+
+        threads.emplace_back([threadOptions, threadSaveOptions, &globalResult, &activeJobs, &jobCv, &tr
+#ifdef _OPENMP
+            , ompPerJob
+#endif
+        ]() mutable {
+#ifdef _OPENMP
+            omp_set_num_threads(ompPerJob);
+#endif
+            ImageIO io;
+            CoutProgressIndicator progress;
+            int numImages = threadOptions.fileNames.size();
+            int loadResult = io.load(threadOptions, progress);
+            if (loadResult < numImages * 2) {
+                int format = loadResult & 1;
+                int i = loadResult >> 1;
+                if (format) {
+                    Log::progress(tr("Error loading %1, it has a different format.").arg(threadOptions.fileNames[i]));
+                } else {
+                    Log::progress(tr("Error loading %1, file not found.").arg(threadOptions.fileNames[i]));
+                }
+                globalResult.store(1);
             } else {
-                cerr << tr("Error loading %1, file not found.").arg(options.fileNames[i]) << endl;
+                SaveOptions setOptions = threadSaveOptions;
+                if (!setOptions.fileName.isEmpty()) {
+                    setOptions.fileName = io.replaceArguments(setOptions.fileName, "");
+                    int extPos = setOptions.fileName.lastIndexOf('.');
+                    if (extPos > setOptions.fileName.length() || setOptions.fileName.mid(extPos) != ".dng") {
+                        setOptions.fileName += ".dng";
+                    }
+                } else {
+                    setOptions.fileName = io.buildOutputFileName();
+                }
+                Log::progress(tr("Writing result to %1").arg(setOptions.fileName));
+                io.save(setOptions, progress);
             }
-            result = 1;
-            continue;
-        }
-        SaveOptions setOptions = saveOptions;
-        if (!setOptions.fileName.isEmpty()) {
-            setOptions.fileName = io.replaceArguments(setOptions.fileName, "");
-            int extPos = setOptions.fileName.lastIndexOf('.');
-            if (extPos > setOptions.fileName.length() || setOptions.fileName.mid(extPos) != ".dng") {
-                setOptions.fileName += ".dng";
-            }
-        } else {
-            setOptions.fileName = io.buildOutputFileName();
-        }
-        Log::progress(tr("Writing result to %1").arg(setOptions.fileName));
-        io.save(setOptions, progress);
+
+            activeJobs--;
+            jobCv.notify_one();
+        });
     }
-    return result;
+
+    for (auto & t : threads) {
+        t.join();
+    }
+
+    double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+    Log::progress("Total processing time: ", elapsed, " seconds");
+    return globalResult.load();
 }
 
 
@@ -227,9 +343,34 @@ void Launcher::parseCommandLine() {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
             }
+        } else if (string("-d") == argv[i]) {
+            if (++i < argc) {
+                scanDirectory(QString::fromLocal8Bit(argv[i]), generalOptions.fileNames);
+            }
+        } else if (string("-j") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    maxJobs = stoi(argv[i]);
+                    if (maxJobs < 1) maxJobs = 1;
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                    maxJobs = 0;
+                }
+            }
         } else if (argv[i][0] != '-') {
-            generalOptions.fileNames.push_back(QString::fromLocal8Bit(argv[i]));
+            QString arg = QString::fromLocal8Bit(argv[i]);
+            QFileInfo fi(arg);
+            if (fi.isDir()) {
+                scanDirectory(arg, generalOptions.fileNames);
+            } else {
+                generalOptions.fileNames.push_back(arg);
+            }
         }
+    }
+    // Set default maxJobs if not specified
+    if (maxJobs == 0) {
+        unsigned int hw = std::thread::hardware_concurrency();
+        maxJobs = std::max(1u, hw / 2);
     }
 }
 
@@ -272,7 +413,9 @@ void Launcher::showHelp() {
     cout << "    " << "-v            " << tr("Verbose mode.") << endl;
     cout << "    " << "-vv           " << tr("Debug mode.") << endl;
     cout << "    " << "-w whitelevel " << tr("Use custom white level.") << endl;
-    cout << "    " << "RAW_FILES     " << tr("The input raw files.") << endl;
+    cout << "    " << "-j N          " << tr("Number of concurrent merge jobs in batch mode. Default: half of CPU cores.") << endl;
+    cout << "    " << "-d DIR        " << tr("Scan directory for raw files.") << endl;
+    cout << "    " << "RAW_FILES     " << tr("The input raw files or directories containing raw files.") << endl;
 }
 
 
@@ -290,6 +433,12 @@ bool Launcher::checkGUI() {
             useGUI = false;
         } else if (string("-B") == argv[i]) {
             useGUI = false;
+        } else if (string("-j") == argv[i]) {
+            ++i; // skip the value
+        } else if (string("-d") == argv[i]) {
+            if (++i < argc) {
+                numFiles++;
+            }
         } else if (string("--help") == argv[i]) {
             return false;
         } else if (argv[i][0] != '-') {

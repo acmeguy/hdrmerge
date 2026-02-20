@@ -26,6 +26,7 @@
 #include <ostream>
 #include <string>
 #include <chrono>
+#include <mutex>
 #include <QString>
 
 namespace hdrmerge {
@@ -47,6 +48,7 @@ public:
     static void msg(int priority, const Args &... params) {
         Log & l = getInstance();
         if (l.out && priority >= l.minPriority) {
+            std::lock_guard<std::mutex> lock(l.mtx);
             l.output(params...);
             *l.out << std::endl;
         }
@@ -56,6 +58,7 @@ public:
     static void msgN(int priority, const Args &... params) {
         Log & l = getInstance();
         if (l.out && priority >= l.minPriority) {
+            std::lock_guard<std::mutex> lock(l.mtx);
             l.output(params...);
         }
     }
@@ -91,6 +94,7 @@ public:
 private:
     int minPriority;
     std::ostream * out;
+    std::mutex mtx;
 
     Log() : minPriority(2), out(nullptr) {}
 

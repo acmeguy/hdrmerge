@@ -111,7 +111,6 @@ public:
     void dumpFile(const std::string & fileName);
 
 private:
-    static const int ones[256];
     static const uint32_t allOnes = -1;
 
     std::unique_ptr<uint32_t[]> bits;

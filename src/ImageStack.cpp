@@ -405,61 +405,53 @@ Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadi
     dst.displace(-(int)params.leftMargin, -(int)params.topMargin);
     dst.fillBorders(0.f);
 
-    float max = 0.0;
+    float maxVal = 0.0;
     double saturatedRange = params.max - satThreshold;
-    #pragma omp parallel
-    {
-        float maxthr = 0.0;
-        #pragma omp for schedule(dynamic,16) nowait
-        for (size_t y = 0; y < height; ++y) {
-            for (size_t x = 0; x < width; ++x) {
-                double v, vv;
-                double p = map(x,y);
-                p = p < 0.0 ? 0.0 : p;
-                int j = p;
-                if (images[j].contains(x, y)) {
-                    p = p - j;
-                    v = images[j].exposureAt(x, y);
-                    // Adjust false highlights
-                    if (j < origMask(x,y)) { // SaturatedAround
-                        v /= params.whiteMultAt(x, y);
-                        if(p > 0.0001) {
-                            uint16_t rawV = images[j].getMaxAround(x, y);
-                            double k = (rawV - satThreshold) / saturatedRange;
-                            if (k > 1.0)
-                                k = 1.0;
-                            p += (1.0 - p) * k;
-                        }
+    #pragma omp parallel for schedule(dynamic,16) reduction(max:maxVal)
+    for (size_t y = 0; y < height; ++y) {
+        for (size_t x = 0; x < width; ++x) {
+            double v, vv;
+            double p = map(x,y);
+            p = p < 0.0 ? 0.0 : p;
+            int j = p;
+            if (images[j].contains(x, y)) {
+                p = p - j;
+                v = images[j].exposureAt(x, y);
+                // Adjust false highlights
+                if (j < origMask(x,y)) { // SaturatedAround
+                    v /= params.whiteMultAt(x, y);
+                    if(p > 0.0001) {
+                        uint16_t rawV = images[j].getMaxAround(x, y);
+                        double k = (rawV - satThreshold) / saturatedRange;
+                        if (k > 1.0)
+                            k = 1.0;
+                        p += (1.0 - p) * k;
                     }
-                } else {
-                    v = 0.0;
-                    p = 1.0;
                 }
-                if (p > 0.0001 && j < imageMax && images[j + 1].contains(x, y)) {
-                    vv = images[j + 1].exposureAt(x, y);
-                    if (j + 1 < origMask(x,y)) { // SaturatedAround
-                        vv /= params.whiteMultAt(x, y);
-                    }
-                } else {
-                    vv = 0.0;
-                    p = 0.0;
-                }
-                v -= p * (v - vv);
-                dst(x, y) = v;
-                if (v > maxthr) {
-                    maxthr = v;
-                }
+            } else {
+                v = 0.0;
+                p = 1.0;
             }
-        }
-        #pragma omp critical
-        if (maxthr > max) {
-            max = maxthr;
+            if (p > 0.0001 && j < imageMax && images[j + 1].contains(x, y)) {
+                vv = images[j + 1].exposureAt(x, y);
+                if (j + 1 < origMask(x,y)) { // SaturatedAround
+                    vv /= params.whiteMultAt(x, y);
+                }
+            } else {
+                vv = 0.0;
+                p = 0.0;
+            }
+            v -= p * (v - vv);
+            dst(x, y) = v;
+            if (v > maxVal) {
+                maxVal = v;
+            }
         }
     }
 
     dst.displace(params.leftMargin, params.topMargin);
     // Scale to params.max and recover the black levels
-    float mult = (params.max - params.maxBlack) / max;
+    float mult = (params.max - params.maxBlack) / maxVal;
     #pragma omp parallel for
     for (size_t y = 0; y < params.rawHeight; ++y) {
         for (size_t x = 0; x < params.rawWidth; ++x) {

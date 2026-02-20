@@ -49,7 +49,7 @@ struct SaveOptions {
     bool saveMask;
     QString maskFileName;
     int featherRadius;
-    SaveOptions() : bps(16), previewSize(0), saveMask(false), featherRadius(3) {}
+    SaveOptions() : bps(32), previewSize(0), saveMask(false), featherRadius(3) {}
 };
 
 } // namespace hdrmerge

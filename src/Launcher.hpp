@@ -49,6 +49,7 @@ private:
     LoadOptions generalOptions;
     SaveOptions saveOptions;
     bool help;
+    int maxJobs;
 };
 
 } // namespace hdrmerge

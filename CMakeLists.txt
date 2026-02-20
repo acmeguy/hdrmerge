@@ -51,7 +51,7 @@ find_package(OpenMP)
 # Commented-out as it doesn't link
 #find_package(Boost 1.46 COMPONENTS unit_test_framework)
 
-if(WIN32)
+if(WIN32 OR APPLE)
     set(ALGLIB_INCLUDES ${ALGLIB_ROOT}/src)
 else()
     find_package(ALGLIB REQUIRED)
@@ -69,6 +69,7 @@ if(NOT(CMAKE_BUILD_TYPE))
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native")
     if(OPENMP_FOUND)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
     endif()
