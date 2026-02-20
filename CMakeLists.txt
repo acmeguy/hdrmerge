@@ -45,7 +45,15 @@ add_definitions(${QT_DEFINITIONS})
 
 find_package(LibRaw REQUIRED)
 find_package(Exiv2 REQUIRED)
-find_package(ZLIB REQUIRED)
+if(APPLE)
+    # Use zlib-ng for NEON-optimized DEFLATE on Apple Silicon
+    find_library(ZLIBNG_LIBRARY z-ng PATHS /opt/homebrew/lib REQUIRED)
+    find_path(ZLIBNG_INCLUDE_DIR zlib-ng.h PATHS /opt/homebrew/include REQUIRED)
+    set(ZLIB_LIBRARIES ${ZLIBNG_LIBRARY})
+    set(ZLIB_INCLUDE_DIRS ${ZLIBNG_INCLUDE_DIR})
+else()
+    find_package(ZLIB REQUIRED)
+endif()
 find_package(OpenMP)
 
 # Commented-out as it doesn't link

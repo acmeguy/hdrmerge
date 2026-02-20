@@ -25,7 +25,12 @@
 #include <QBuffer>
 #include <QDateTime>
 #include <QImageWriter>
+#ifdef __APPLE__
+#include <zlib-ng.h>
+#define compress zng_compress
+#else
 #include <zlib.h>
+#endif
 #ifdef __SSE2__
     #include <x86intrin.h>
 #endif
