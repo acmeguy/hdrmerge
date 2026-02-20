@@ -22,14 +22,16 @@
 
 #include <iostream>
 #include <cmath>
+#include <vector>
 #include <QBuffer>
 #include <QDateTime>
 #include <QImageWriter>
-#ifdef __APPLE__
-#include <zlib-ng.h>
-#define compress zng_compress
-#else
 #include <zlib.h>
+#ifdef HAVE_LIBDEFLATE
+#include <libdeflate.h>
+#endif
+#ifdef _OPENMP
+#include <omp.h>
 #endif
 #ifdef __SSE2__
     #include <x86intrin.h>
@@ -518,6 +520,17 @@ void DngFloatWriter::writeRawData() {
     int bytesps = bps >> 3;
     uLongf dstLen = tileWidth * tileLength * bytesps;
 
+#ifdef HAVE_LIBDEFLATE
+    // Create one compressor per thread (libdeflate instances are not thread-safe)
+    int nThreads = 1;
+    #ifdef _OPENMP
+    nThreads = omp_get_max_threads();
+    #endif
+    std::vector<struct libdeflate_compressor*> compressors(nThreads);
+    for (int i = 0; i < nThreads; i++)
+        compressors[i] = libdeflate_alloc_compressor(6);
+#endif
+
     #pragma omp parallel
     {
         Bytef * cBuffer = new Bytef[dstLen];
@@ -538,12 +551,26 @@ void DngFloatWriter::writeRawData() {
                     compressFloats(src, thisTileWidth, bytesps);
                     encodeFPDeltaRow(src, dst, thisTileWidth, tileWidth, bytesps, 2);
                 }
+#ifdef HAVE_LIBDEFLATE
+                int tid = 0;
+                #ifdef _OPENMP
+                tid = omp_get_thread_num();
+                #endif
+                size_t compressedLength = libdeflate_zlib_compress(
+                    compressors[tid], uBuffer, dstLen, cBuffer, dstLen);
+                tileBytes[t] = compressedLength;
+                if (compressedLength == 0) {
+                    std::cerr << "DNG Deflate: Failed compressing tile " << t << std::endl;
+                }
+#else
                 uLongf conpressedLength = dstLen;
                 int err = compress(cBuffer, &conpressedLength, uBuffer, dstLen);
                 tileBytes[t] = conpressedLength;
                 if (err != Z_OK) {
                     std::cerr << "DNG Deflate: Failed compressing tile " << t << ", with error " << err << std::endl;
-                } else {
+                }
+#endif
+                else {
                     #pragma omp critical
                     {
                         tileOffsets[t] = pos;
@@ -557,6 +584,10 @@ void DngFloatWriter::writeRawData() {
         delete [] cBuffer;
         delete [] uBuffer;
     }
+
+#ifdef HAVE_LIBDEFLATE
+    for (auto c : compressors) libdeflate_free_compressor(c);
+#endif
 
     rawIFD.setValue(TILEOFFSETS, tileOffsets);
     rawIFD.setValue(TILEBYTES, tileBytes);

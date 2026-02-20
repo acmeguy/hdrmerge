@@ -45,15 +45,16 @@ add_definitions(${QT_DEFINITIONS})
 
 find_package(LibRaw REQUIRED)
 find_package(Exiv2 REQUIRED)
-if(APPLE)
-    # Use zlib-ng for NEON-optimized DEFLATE on Apple Silicon
-    find_library(ZLIBNG_LIBRARY z-ng PATHS /opt/homebrew/lib REQUIRED)
-    find_path(ZLIBNG_INCLUDE_DIR zlib-ng.h PATHS /opt/homebrew/include REQUIRED)
-    set(ZLIB_LIBRARIES ${ZLIBNG_LIBRARY})
-    set(ZLIB_INCLUDE_DIRS ${ZLIBNG_INCLUDE_DIR})
+# libdeflate for fast DEFLATE compression in DNG writer
+find_library(LIBDEFLATE_LIBRARY deflate PATHS /opt/homebrew/lib)
+find_path(LIBDEFLATE_INCLUDE_DIR libdeflate.h PATHS /opt/homebrew/include)
+if(LIBDEFLATE_LIBRARY AND LIBDEFLATE_INCLUDE_DIR)
+    message(STATUS "Found libdeflate: ${LIBDEFLATE_LIBRARY}")
+    add_definitions(-DHAVE_LIBDEFLATE)
 else()
-    find_package(ZLIB REQUIRED)
+    message(STATUS "libdeflate not found, falling back to zlib")
 endif()
+find_package(ZLIB REQUIRED)
 find_package(OpenMP)
 
 # Commented-out as it doesn't link
@@ -70,6 +71,7 @@ include_directories(
     "${EXIV2_INCLUDE_DIR}"
     "${ZLIB_INCLUDE_DIRS}"
     "${ALGLIB_INCLUDES}"
+    "${LIBDEFLATE_INCLUDE_DIR}"
 )
 
 if(NOT(CMAKE_BUILD_TYPE))
@@ -202,6 +204,7 @@ set(hdrmerge_libs
     "${LibRaw_r_LIBRARIES}"
     "${EXIV2_LIBRARY}"
     "${ZLIB_LIBRARIES}"
+    "${LIBDEFLATE_LIBRARY}"
 )
 
 if(WIN32)
