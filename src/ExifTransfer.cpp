@@ -23,44 +23,31 @@
 #include <exiv2/exiv2.hpp>
 #include <iostream>
 #include "ExifTransfer.hpp"
-#include "Log.hpp"
 using namespace hdrmerge;
 using namespace Exiv2;
 using namespace std;
 
-
-class ExifTransfer {
-public:
-    ExifTransfer(const QString & srcFile, const QString & dstFile,
-                 const uint8_t * data, size_t dataSize)
-    : srcFile(srcFile), dstFile(dstFile), data(data), dataSize(dataSize) {}
-
-    void copyMetadata();
-
-private:
-    QString srcFile, dstFile;
-    const uint8_t * data;
-    size_t dataSize;
 #if EXIV2_TEST_VERSION(0,28,0)
-    Exiv2::Image::UniquePtr src, dst;
+using ExivImagePtr = Exiv2::Image::UniquePtr;
 #else
-    Exiv2::Image::AutoPtr src, dst;
+using ExivImagePtr = Exiv2::Image::AutoPtr;
 #endif
 
-    void copyXMP();
-    void copyIPTC();
-    void copyEXIF();
-};
+static bool excludeExifDatum(const Exiv2::Exifdatum & datum);
+static void copyXMP(Exiv2::Image & src, Exiv2::Image & dst);
+static void copyIPTC(Exiv2::Image & src, Exiv2::Image & dst);
+static void copyEXIF(Exiv2::Image & src, Exiv2::Image & dst);
+
+static void copyAllMetadata(ExivImagePtr & src, ExivImagePtr & dst) {
+    copyXMP(*src, *dst);
+    copyIPTC(*src, *dst);
+    copyEXIF(*src, *dst);
+}
 
 
 void hdrmerge::Exif::transfer(const QString & srcFile, const QString & dstFile,
                  const uint8_t * data, size_t dataSize) {
-    ExifTransfer exif(srcFile, dstFile, data, dataSize);
-    exif.copyMetadata();
-}
-
-
-void ExifTransfer::copyMetadata() {
+    ExivImagePtr dst, src;
     try {
 #if EXIV2_TEST_VERSION(0,28,0)
         dst = Exiv2::ImageFactory::open(BasicIo::UniquePtr(new MemIo(data, dataSize)));
@@ -75,9 +62,7 @@ void ExifTransfer::copyMetadata() {
     try {
         src = Exiv2::ImageFactory::open(srcFile.toLocal8Bit().constData());
         src->readMetadata();
-        copyXMP();
-        copyIPTC();
-        copyEXIF();
+        copyAllMetadata(src, dst);
     } catch (Exiv2::Error & e) {
         std::cerr << "Exiv2 error: " << e.what() << std::endl;
         // At least we have to set the SubImage1 file type to Primary Image
@@ -95,9 +80,9 @@ void ExifTransfer::copyMetadata() {
 }
 
 
-void ExifTransfer::copyXMP() {
-    const Exiv2::XmpData & srcXmp = src->xmpData();
-    Exiv2::XmpData & dstXmp = dst->xmpData();
+static void copyXMP(Exiv2::Image & src, Exiv2::Image & dst) {
+    const Exiv2::XmpData & srcXmp = src.xmpData();
+    Exiv2::XmpData & dstXmp = dst.xmpData();
     for (const auto & datum : srcXmp) {
         if (datum.groupName() != "tiff" && dstXmp.findKey(Exiv2::XmpKey(datum.key())) == dstXmp.end()) {
             dstXmp.add(datum);
@@ -106,9 +91,9 @@ void ExifTransfer::copyXMP() {
 }
 
 
-void ExifTransfer::copyIPTC() {
-    const Exiv2::IptcData & srcIptc = src->iptcData();
-    Exiv2::IptcData & dstIptc = dst->iptcData();
+static void copyIPTC(Exiv2::Image & src, Exiv2::Image & dst) {
+    const Exiv2::IptcData & srcIptc = src.iptcData();
+    Exiv2::IptcData & dstIptc = dst.iptcData();
     for (const auto & datum : srcIptc) {
         if (dstIptc.findKey(Exiv2::IptcKey(datum.key())) == dstIptc.end()) {
             dstIptc.add(datum);
@@ -153,7 +138,7 @@ static bool excludeExifDatum(const Exifdatum & datum) {
 }
 
 
-void ExifTransfer::copyEXIF() {
+static void copyEXIF(Exiv2::Image & src, Exiv2::Image & dst) {
     static const char * includeImageKeys[] = {
         // Correct Make and Model, from the input files
         // It is needed so that makernote tags are correctly copied
@@ -168,8 +153,8 @@ void ExifTransfer::copyEXIF() {
         "Exif.SubImage1.OpcodeList3"
     };
 
-    const Exiv2::ExifData & srcExif = src->exifData();
-    Exiv2::ExifData & dstExif = dst->exifData();
+    const Exiv2::ExifData & srcExif = src.exifData();
+    Exiv2::ExifData & dstExif = dst.exifData();
 
     for (const char * keyName : includeImageKeys) {
         auto iterator = srcExif.findKey(Exiv2::ExifKey(keyName));
