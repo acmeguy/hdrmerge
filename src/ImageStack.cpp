@@ -545,7 +545,127 @@ static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
 }
 #endif
 
-Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma) const {
+void ImageStack::correctHotPixels(const RawParameters & params, float sigma) {
+    if (sigma <= 0.0f || images.size() < 2) return;
+
+    const int numImages = (int)images.size();
+    const int margin = 2;
+    const int w = (int)width;
+    const int h = (int)height;
+
+    // Candidate neighbor offsets — distance 2 in cardinal and diagonal directions
+    static const int offsets[][2] = {
+        {-2, 0}, {2, 0}, {0, -2}, {0, 2},
+        {-2, -2}, {-2, 2}, {2, -2}, {2, 2}
+    };
+    static const int numOffsets = 8;
+
+    size_t corrected = 0;
+    #pragma omp parallel for schedule(dynamic, 16) reduction(+:corrected)
+    for (int y = margin; y < h - margin; ++y) {
+        std::vector<uint16_t> neighbors(numOffsets);
+        std::vector<double> ratios(numImages);
+        std::vector<double> absDevs(numImages);
+
+        for (int x = margin; x < w - margin; ++x) {
+            uint8_t color = params.FC(x, y);
+
+            // Find same-color neighbors
+            int nCount = 0;
+            for (int k = 0; k < numOffsets; ++k) {
+                int nx = x + offsets[k][0];
+                int ny = y + offsets[k][1];
+                if (nx >= 0 && nx < w && ny >= 0 && ny < h &&
+                    params.FC(nx, ny) == color) {
+                    neighbors[nCount++] = k;
+                }
+            }
+            if (nCount < 2) continue;
+
+            // Collect ratio = pixel / localMedian for each non-saturated exposure
+            int rCount = 0;
+            for (int e = 0; e < numImages; ++e) {
+                if (!images[e].contains(x, y)) continue;
+                uint16_t val = images[e](x, y);
+                if (val < 1 || images[e].isSaturated(val)) continue;
+
+                // Compute local median of same-color neighbors in this exposure
+                std::vector<uint16_t> nvals(nCount);
+                int validN = 0;
+                for (int n = 0; n < nCount; ++n) {
+                    int nx = x + offsets[neighbors[n]][0];
+                    int ny = y + offsets[neighbors[n]][1];
+                    if (images[e].contains(nx, ny)) {
+                        nvals[validN++] = images[e](nx, ny);
+                    }
+                }
+                if (validN < 2) continue;
+
+                std::nth_element(nvals.begin(), nvals.begin() + validN / 2,
+                                 nvals.begin() + validN);
+                double localMedian = nvals[validN / 2];
+                // Skip low-signal exposures where ratios are noise-dominated
+                if (localMedian < 100.0) continue;
+
+                ratios[rCount++] = (double)val / localMedian;
+            }
+
+            if (rCount < 2) continue;
+
+            // MAD outlier detection on ratios
+            std::vector<double> sorted(ratios.begin(), ratios.begin() + rCount);
+            std::nth_element(sorted.begin(), sorted.begin() + rCount / 2, sorted.end());
+            double medianRatio = sorted[rCount / 2];
+
+            for (int i = 0; i < rCount; i++)
+                absDevs[i] = std::abs(ratios[i] - medianRatio);
+            std::nth_element(absDevs.begin(), absDevs.begin() + rCount / 2,
+                             absDevs.begin() + rCount);
+            double mad = absDevs[rCount / 2] * 1.4826;
+
+            if (mad <= 0.0) continue;
+            double threshold = sigma * mad;
+
+            // Check if ANY ratio is a significant outlier — if so, this pixel is hot.
+            // Require both: exceeds MAD threshold AND deviates by >50% from median ratio.
+            // The absolute ratio check prevents false positives from tiny MAD values.
+            bool isHot = false;
+            for (int i = 0; i < rCount; i++) {
+                if (std::abs(ratios[i] - medianRatio) > threshold &&
+                    std::abs(ratios[i] / medianRatio - 1.0) > 0.5) {
+                    isHot = true;
+                    break;
+                }
+            }
+            if (!isHot) continue;
+
+            // Replace this pixel in ALL exposures with same-color neighbor median
+            for (int e = 0; e < numImages; ++e) {
+                if (!images[e].contains(x, y)) continue;
+
+                std::vector<uint16_t> nvals(nCount);
+                int validN = 0;
+                for (int n = 0; n < nCount; ++n) {
+                    int nx = x + offsets[neighbors[n]][0];
+                    int ny = y + offsets[neighbors[n]][1];
+                    if (images[e].contains(nx, ny)) {
+                        nvals[validN++] = images[e](nx, ny);
+                    }
+                }
+                if (validN > 0) {
+                    std::nth_element(nvals.begin(), nvals.begin() + validN / 2,
+                                     nvals.begin() + validN);
+                    images[e](x, y) = nvals[validN / 2];
+                }
+            }
+            corrected++;
+        }
+    }
+    Log::progress("Hot pixel correction: ", corrected, " pixels corrected (sigma=", sigma, ")");
+}
+
+
+ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, double clipPercentile) const {
     int imageMax = images.size() - 1;
     BoxBlur map(fattenMask(mask, featherRadius));
     measureTime("Blur", [&] () {
@@ -578,10 +698,9 @@ Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadi
     float maxVal = 0.0;
     #pragma omp parallel for schedule(dynamic,16) reduction(max:maxVal)
     for (size_t y = 0; y < height; ++y) {
-        // Per-thread stack arrays (max 10 exposures is generous)
-        double radiances[10];
-        double weights[10];
-        double absDevs[10];
+        std::vector<double> radiances(numImages);
+        std::vector<double> weights(numImages);
+        std::vector<double> absDevs(numImages);
 
         for (size_t x = 0; x < width; ++x) {
             int numValid = 0;
@@ -606,22 +725,20 @@ Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadi
                 radiances[numValid] = radiance;
                 weights[numValid] = w;
                 numValid++;
-                if (numValid >= 10) break;
             }
 
             // Sigma-clipping ghost detection: reject outlier exposures
             // using MAD (median absolute deviation) before weighted merge
             if (deghost && numValid >= 3) {
                 // Find median radiance (partial sort)
-                double sorted[10];
-                for (int i = 0; i < numValid; i++) sorted[i] = radiances[i];
-                std::nth_element(sorted, sorted + numValid / 2, sorted + numValid);
+                std::vector<double> sorted(radiances.begin(), radiances.begin() + numValid);
+                std::nth_element(sorted.begin(), sorted.begin() + numValid / 2, sorted.end());
                 double median = sorted[numValid / 2];
 
                 // Compute MAD
                 for (int i = 0; i < numValid; i++)
                     absDevs[i] = std::abs(radiances[i] - median);
-                std::nth_element(absDevs, absDevs + numValid / 2, absDevs + numValid);
+                std::nth_element(absDevs.begin(), absDevs.begin() + numValid / 2, absDevs.begin() + numValid);
                 double mad = absDevs[numValid / 2] * 1.4826; // MAD to sigma
 
                 // Reject outliers (set weight to 0)
@@ -670,15 +787,76 @@ Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadi
     }
 
     dst.displace(params.leftMargin, params.topMargin);
-    // Scale to params.max and recover the black levels
-    float mult = (params.max - params.maxBlack) / maxVal;
-    #pragma omp parallel for
-    for (size_t y = 0; y < params.rawHeight; ++y) {
-        for (size_t x = 0; x < params.rawWidth; ++x) {
-            dst(x, y) *= mult;
-            dst(x, y) += params.blackAt(x - params.leftMargin, y - params.topMargin);
+
+    // Determine normalization value: percentile-based or global max
+    float normVal = maxVal;
+    if (clipPercentile < 100.0 && maxVal > 0.0f) {
+        // Collect active-area pixel values for percentile computation
+        std::vector<float> activePixels;
+        activePixels.reserve(params.width * params.height);
+        for (size_t y = params.topMargin; y < params.topMargin + params.height; ++y) {
+            for (size_t x = params.leftMargin; x < params.leftMargin + params.width; ++x) {
+                float v = dst(x, y);
+                if (v > 0.0f) {
+                    activePixels.push_back(v);
+                }
+            }
+        }
+        if (!activePixels.empty()) {
+            size_t idx = static_cast<size_t>(
+                (clipPercentile / 100.0) * (activePixels.size() - 1));
+            std::nth_element(activePixels.begin(),
+                             activePixels.begin() + idx,
+                             activePixels.end());
+            float pctVal = activePixels[idx];
+            // Safety: if percentile value is implausibly low, fall back to maxVal
+            if (pctVal >= 0.01f * maxVal) {
+                normVal = pctVal;
+            }
         }
     }
 
-    return dst;
+    // Scale to params.max and recover the black levels
+    float mult = (params.max - params.maxBlack) / normVal;
+    float clampMax = static_cast<float>(params.max - params.maxBlack);
+    #pragma omp parallel for
+    for (size_t y = 0; y < params.rawHeight; ++y) {
+        for (size_t x = 0; x < params.rawWidth; ++x) {
+            float v = dst(x, y) * mult;
+            if (v > clampMax) v = clampMax;
+            dst(x, y) = v + params.blackAt(x - params.leftMargin, y - params.topMargin);
+        }
+    }
+
+    // Compute BaselineExposure from geometric mean of active-area pixels
+    double baselineExposureEV = 0.0;
+    {
+        double logSum = 0.0;
+        size_t logCount = 0;
+        #pragma omp parallel for reduction(+:logSum,logCount)
+        for (size_t y = params.topMargin; y < params.topMargin + params.height; ++y) {
+            for (size_t x = params.leftMargin; x < params.leftMargin + params.width; ++x) {
+                float v = dst(x, y) - params.blackAt(x - params.leftMargin, y - params.topMargin);
+                if (v > 0.0f) {
+                    logSum += std::log(static_cast<double>(v));
+                    logCount++;
+                }
+            }
+        }
+        if (logCount > 0) {
+            double geometricMean = std::exp(logSum / logCount);
+            double range = static_cast<double>(params.max - params.maxBlack);
+            if (geometricMean > 0.0 && range > 0.0) {
+                baselineExposureEV = std::log2(0.18 * range / geometricMean);
+                // Clamp to [-5.0, +5.0]
+                if (baselineExposureEV < -5.0) baselineExposureEV = -5.0;
+                if (baselineExposureEV > 5.0) baselineExposureEV = 5.0;
+            }
+        }
+    }
+    Log::debug("Normalization: clipPercentile=", clipPercentile,
+               " normVal=", normVal, " maxVal=", maxVal,
+               " BaselineExposure=", baselineExposureEV, " EV");
+
+    return { std::move(dst), baselineExposureEV, numImages };
 }

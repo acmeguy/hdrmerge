@@ -49,10 +49,20 @@ struct SaveOptions {
     QString fileName;
     bool saveMask;
     QString maskFileName;
+    QString outputDir;
     int featherRadius;
     int compressionLevel;
     float deghostSigma;
-    SaveOptions() : bps(32), previewSize(0), saveMask(false), featherRadius(3), compressionLevel(6), deghostSigma(0.0f) {}
+    double clipPercentile;
+    QString acrProfilePath;
+    double evShift;
+    float hotPixelSigma;
+    bool autoCurves;
+    int resizeLong;
+    SaveOptions() : bps(24), previewSize(0), saveMask(false), featherRadius(3),
+        compressionLevel(6), deghostSigma(0.0f), clipPercentile(99.9),
+        evShift(0.0), hotPixelSigma(0.0f),
+        autoCurves(false), resizeLong(0) {}
 };
 
 } // namespace hdrmerge

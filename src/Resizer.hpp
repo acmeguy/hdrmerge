@@ -20,27 +20,27 @@
  *
  */
 
-#ifndef _EXIFTRANSFER_HPP_
-#define _EXIFTRANSFER_HPP_
+#ifndef _RESIZER_HPP_
+#define _RESIZER_HPP_
 
-#include <vector>
-#include <utility>
-#include <QString>
+#include "Array2D.hpp"
+#include "CFAPattern.hpp"
 
 namespace hdrmerge {
 
-    struct AdaptiveCurves {
-        bool valid = false;
-        std::vector<std::pair<int,int>> red, green, blue;
-    };
+struct ResizeResult {
+    Array2D<float> image;
+    size_t rawWidth, rawHeight;
+    size_t width, height;
+    size_t topMargin, leftMargin;
+};
 
-    namespace Exif {
-        void transferFile(const QString & srcFile, const QString & tmpFile,
-                 const QString & dstFile,
-                 const QString & acrProfilePath,
-                 const AdaptiveCurves & curves);
-    }
+ResizeResult resizeCFA(Array2D<float> && input,
+    size_t rawWidth, size_t rawHeight,
+    size_t width, size_t height,
+    size_t topMargin, size_t leftMargin,
+    int targetLongEdge, const CFAPattern & cfa);
 
-}
+} // namespace hdrmerge
 
-#endif // _EXIFTRANSFER_HPP_
+#endif // _RESIZER_HPP_

@@ -22,6 +22,7 @@
 
 #include <iostream>
 #include <iomanip>
+#include <set>
 #include <string>
 #include <thread>
 #include <mutex>
@@ -113,15 +114,37 @@ list<LoadOptions> Launcher::getBracketedSets() {
         }
     }
     dateNames.sort();
+
+    // Phase 1: Group by time gap
+    using DateName = pair<ImageIO::QDateInterval, QString>;
+    list<list<DateName>> timeGroups;
     ImageIO::QDateInterval lastInterval;
-    for (auto & dateName : dateNames) {
-        if (lastInterval.start.isNull() || lastInterval.difference(dateName.first) > generalOptions.batchGap) {
-            result.push_back(generalOptions);
-            result.back().fileNames.clear();
+    for (auto & dn : dateNames) {
+        if (lastInterval.start.isNull() || lastInterval.difference(dn.first) > generalOptions.batchGap) {
+            timeGroups.emplace_back();
         }
-        result.back().fileNames.push_back(dateName.second);
-        lastInterval = dateName.first;
+        timeGroups.back().push_back(dn);
+        lastInterval = dn.first;
     }
+
+    // Phase 2: Subdivide by EV pattern (detect repeated exposure values)
+    for (auto & tg : timeGroups) {
+        result.push_back(generalOptions);
+        result.back().fileNames.clear();
+        std::set<int> seenEVs;
+        for (auto & dn : tg) {
+            int evKey = dn.first.evThird();
+            if (seenEVs.count(evKey) && result.back().fileNames.size() >= 2) {
+                // EV repeat — start new bracket set
+                result.push_back(generalOptions);
+                result.back().fileNames.clear();
+                seenEVs.clear();
+            }
+            seenEVs.insert(evKey);
+            result.back().fileNames.push_back(dn.second);
+        }
+    }
+
     int setNum = 0;
     for (auto & i : result) {
         Log::progressN("Set ", setNum++, ":");
@@ -131,6 +154,16 @@ list<LoadOptions> Launcher::getBracketedSets() {
         Log::progress();
     }
     return result;
+}
+
+
+static QString applyOutputDir(const QString & fileName, const QString & outputDir) {
+    if (outputDir.isEmpty()) return fileName;
+    QDir outDir(outputDir);
+    if (outDir.isRelative())
+        outDir.setPath(QDir::currentPath() + "/" + outputDir);
+    outDir.mkpath(".");
+    return outDir.absolutePath() + "/" + QFileInfo(fileName).fileName();
 }
 
 
@@ -178,6 +211,7 @@ int Launcher::automaticMerge() {
             } else {
                 setOptions.fileName = io.buildOutputFileName();
             }
+            setOptions.fileName = applyOutputDir(setOptions.fileName, setOptions.outputDir);
             Log::progress(tr("Writing result to %1").arg(setOptions.fileName));
             io.save(setOptions, progress);
         }
@@ -250,6 +284,7 @@ int Launcher::automaticMerge() {
                 } else {
                     setOptions.fileName = io.buildOutputFileName();
                 }
+                setOptions.fileName = applyOutputDir(setOptions.fileName, setOptions.outputDir);
                 Log::progress(tr("Writing result to %1").arg(setOptions.fileName));
                 io.save(setOptions, progress);
             }
@@ -271,6 +306,8 @@ int Launcher::automaticMerge() {
 
 void Launcher::parseCommandLine() {
     auto tr = [&] (const char * text) { return QCoreApplication::translate("Help", text); };
+    bool explicitBps = false;
+    bool explicitC = false;
     for (int i = 1; i < argc; ++i) {
         if (string("-o") == argv[i]) {
             if (++i < argc) {
@@ -301,7 +338,10 @@ void Launcher::parseCommandLine() {
             if (++i < argc) {
                 try {
                     int value = stoi(argv[i]);
-                    if (value == 32 || value == 24 || value == 16) saveOptions.bps = value;
+                    if (value == 32 || value == 24 || value == 16) {
+                        saveOptions.bps = value;
+                        explicitBps = true;
+                    }
                 } catch (std::invalid_argument & e) {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
@@ -350,6 +390,7 @@ void Launcher::parseCommandLine() {
                 try {
                     int level = stoi(argv[i]);
                     saveOptions.compressionLevel = std::min(12, std::max(1, level));
+                    explicitC = true;
                 } catch (std::invalid_argument & e) {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
@@ -361,6 +402,54 @@ void Launcher::parseCommandLine() {
                 } catch (std::invalid_argument & e) {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
+            }
+        } else if (string("--clip-percentile") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    double pct = stod(argv[i]);
+                    if (pct >= 90.0 && pct <= 100.0) {
+                        saveOptions.clipPercentile = pct;
+                    } else {
+                        cerr << tr("--clip-percentile must be between 90 and 100.") << endl;
+                    }
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
+        } else if (string("-L") == argv[i]) {
+            if (++i < argc) {
+                saveOptions.acrProfilePath = QString::fromLocal8Bit(argv[i]);
+            }
+        } else if (string("--auto-curves") == argv[i]) {
+            saveOptions.autoCurves = true;
+        } else if (string("--resize-long") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    int val = stoi(argv[i]);
+                    if (val > 0) saveOptions.resizeLong = val;
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
+        } else if (string("--ev-shift") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    saveOptions.evShift = stod(argv[i]);
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
+        } else if (string("--hot-pixel") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    saveOptions.hotPixelSigma = std::max(0.0f, stof(argv[i]));
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
+        } else if (string("-O") == argv[i] || string("--output-dir") == argv[i]) {
+            if (++i < argc) {
+                saveOptions.outputDir = QString::fromLocal8Bit(argv[i]);
             }
         } else if (string("-d") == argv[i]) {
             if (++i < argc) {
@@ -385,6 +474,10 @@ void Launcher::parseCommandLine() {
                 generalOptions.fileNames.push_back(arg);
             }
         }
+    }
+    // -c implies -b 16 (JPEG XL) unless -b was explicitly given
+    if (explicitC && !explicitBps) {
+        saveOptions.bps = 16;
     }
     // Set default maxJobs if not specified
     if (maxJobs == 0) {
@@ -420,7 +513,7 @@ void Launcher::showHelp() {
     cout << "    " << "              " << tr("by comparing the creation time. Implies -a if no output file name is given.") << endl;
     cout << "    " << "-g gap        " << tr("Batch gap, maximum difference in seconds between two images of the same set.") << endl;
     cout << "    " << "--single      " << tr("Include single images in batch mode (the default is to skip them.)") << endl;
-    cout << "    " << "-b BPS        " << tr("Bits per sample, can be 16, 24 or 32.") << endl;
+    cout << "    " << "-b BPS        " << tr("Bits per sample: 16 (JPEG XL), 24 (default) or 32.") << endl;
     cout << "    " << "--no-align    " << tr("Do not auto-align source images.") << endl;
     cout << "    " << "--align-features " << tr("Use feature-based alignment (requires OpenCV). Falls back to MTB if unavailable.") << endl;
     cout << "    " << "--no-crop     " << tr("Do not crop the output image to the optimum size.") << endl;
@@ -433,9 +526,16 @@ void Launcher::showHelp() {
     cout << "    " << "-v            " << tr("Verbose mode.") << endl;
     cout << "    " << "-vv           " << tr("Debug mode.") << endl;
     cout << "    " << "-w whitelevel " << tr("Use custom white level.") << endl;
-    cout << "    " << "-c LEVEL      " << tr("DEFLATE compression level 1-12 (1=fastest, 6=default, 12=smallest).") << endl;
+    cout << "    " << "-c LEVEL      " << tr("Compression level 1-12. Implies -b 16 (JPEG XL) unless -b is also given.") << endl;
     cout << "    " << "--deghost S   " << tr("Sigma-clipping ghost detection. S is the sigma threshold (e.g. 3.0). 0=off (default).") << endl;
+    cout << "    " << "--clip-percentile P " << tr("Normalization percentile (90-100). Default 99.9. Use 100 for legacy behavior.") << endl;
     cout << "    " << "-j N          " << tr("Number of concurrent merge jobs in batch mode. Default: half of CPU cores.") << endl;
+    cout << "    " << "-L PROFILE    " << tr("Apply ACR settings from a Lightroom .xmp preset to output DNGs.") << endl;
+    cout << "    " << "--auto-curves " << tr("Generate per-image adaptive RGB tone curves via ONNX model.") << endl;
+    cout << "    " << "--resize-long N " << tr("Resize output so longest edge is N pixels. CFA-aware Lanczos-3.") << endl;
+    cout << "    " << "--ev-shift EV " << tr("Add EV stops to default rendering brightness. Does not change pixel data.") << endl;
+    cout << "    " << "--hot-pixel S " << tr("Hot/dead pixel correction. S is the sigma threshold (e.g. 3.0). 0=off (default).") << endl;
+    cout << "    " << "-O|--output-dir DIR " << tr("Write output files to DIR instead of alongside inputs.") << endl;
     cout << "    " << "-d DIR        " << tr("Scan directory for raw files.") << endl;
     cout << "    " << "RAW_FILES     " << tr("The input raw files or directories containing raw files.") << endl;
 }
@@ -461,7 +561,21 @@ bool Launcher::checkGUI() {
             ++i; // skip the value
         } else if (string("--deghost") == argv[i]) {
             ++i; // skip the value
+        } else if (string("--clip-percentile") == argv[i]) {
+            ++i; // skip the value
         } else if (string("-j") == argv[i]) {
+            ++i; // skip the value
+        } else if (string("-L") == argv[i]) {
+            ++i; // skip the value
+        } else if (string("--auto-curves") == argv[i]) {
+            // flag only, no effect on GUI decision
+        } else if (string("--resize-long") == argv[i]) {
+            ++i; // skip the value
+        } else if (string("--ev-shift") == argv[i]) {
+            ++i; // skip the value
+        } else if (string("--hot-pixel") == argv[i]) {
+            ++i; // skip the value
+        } else if (string("-O") == argv[i] || string("--output-dir") == argv[i]) {
             ++i; // skip the value
         } else if (string("-d") == argv[i]) {
             if (++i < argc) {
