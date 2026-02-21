@@ -545,7 +545,7 @@ static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
 }
 #endif
 
-Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadius) const {
+Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma) const {
     int imageMax = images.size() - 1;
     BoxBlur map(fattenMask(mask, featherRadius));
     measureTime("Blur", [&] () {
@@ -559,8 +559,9 @@ Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadi
     // Poisson-optimal merge: weight each exposure by 1/relativeExposure (∝ exposure time).
     // This is the MLE weight for Poisson noise — longer exposures captured more photons
     // and thus have lower relative noise, so they get higher weight.
-    std::vector<double> baseWeight(images.size());
-    for (size_t k = 0; k < images.size(); k++) {
+    const int numImages = (int)images.size();
+    std::vector<double> baseWeight(numImages);
+    for (int k = 0; k < numImages; k++) {
         baseWeight[k] = 1.0 / images[k].getRelativeExposure();
     }
 
@@ -569,13 +570,23 @@ Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadi
     const double satRolloff = 0.9 * satThreshold;
     const double satRolloffRange = satThreshold - satRolloff;
 
+    const bool deghost = deghostSigma > 0.0f && numImages >= 3;
+    if (deghost) {
+        Log::debug("Ghost detection enabled: sigma=", deghostSigma);
+    }
+
     float maxVal = 0.0;
     #pragma omp parallel for schedule(dynamic,16) reduction(max:maxVal)
     for (size_t y = 0; y < height; ++y) {
-        for (size_t x = 0; x < width; ++x) {
-            double weightedSum = 0.0;
-            double totalWeight = 0.0;
+        // Per-thread stack arrays (max 10 exposures is generous)
+        double radiances[10];
+        double weights[10];
+        double absDevs[10];
 
+        for (size_t x = 0; x < width; ++x) {
+            int numValid = 0;
+
+            // Collect valid exposures with their radiances and weights
             for (int k = 0; k <= imageMax; k++) {
                 if (!images[k].contains(x, y)) continue;
                 uint16_t raw = images[k](x, y);
@@ -592,8 +603,44 @@ Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadi
                 double radiance = images[k].exposureAt(x, y);
                 if (radiance <= 0.0) continue;
 
-                weightedSum += w * radiance;
-                totalWeight += w;
+                radiances[numValid] = radiance;
+                weights[numValid] = w;
+                numValid++;
+                if (numValid >= 10) break;
+            }
+
+            // Sigma-clipping ghost detection: reject outlier exposures
+            // using MAD (median absolute deviation) before weighted merge
+            if (deghost && numValid >= 3) {
+                // Find median radiance (partial sort)
+                double sorted[10];
+                for (int i = 0; i < numValid; i++) sorted[i] = radiances[i];
+                std::nth_element(sorted, sorted + numValid / 2, sorted + numValid);
+                double median = sorted[numValid / 2];
+
+                // Compute MAD
+                for (int i = 0; i < numValid; i++)
+                    absDevs[i] = std::abs(radiances[i] - median);
+                std::nth_element(absDevs, absDevs + numValid / 2, absDevs + numValid);
+                double mad = absDevs[numValid / 2] * 1.4826; // MAD to sigma
+
+                // Reject outliers (set weight to 0)
+                if (mad > 0.0) {
+                    double threshold = deghostSigma * mad;
+                    for (int i = 0; i < numValid; i++) {
+                        if (std::abs(radiances[i] - median) > threshold) {
+                            weights[i] = 0.0;
+                        }
+                    }
+                }
+            }
+
+            // Weighted merge of surviving exposures
+            double weightedSum = 0.0;
+            double totalWeight = 0.0;
+            for (int i = 0; i < numValid; i++) {
+                weightedSum += weights[i] * radiances[i];
+                totalWeight += weights[i];
             }
 
             double v;

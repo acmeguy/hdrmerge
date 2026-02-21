@@ -51,7 +51,8 @@ struct SaveOptions {
     QString maskFileName;
     int featherRadius;
     int compressionLevel;
-    SaveOptions() : bps(32), previewSize(0), saveMask(false), featherRadius(3), compressionLevel(6) {}
+    float deghostSigma;
+    SaveOptions() : bps(32), previewSize(0), saveMask(false), featherRadius(3), compressionLevel(6), deghostSigma(0.0f) {}
 };
 
 } // namespace hdrmerge

@@ -187,7 +187,7 @@ void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
     params.width = stack.getWidth();
     params.height = stack.getHeight();
     params.adjustWhite(stack.getImage(stack.size() - 1));
-    Array2D<float> composedImage = stack.compose(params, options.featherRadius);
+    Array2D<float> composedImage = stack.compose(params, options.featherRadius, options.deghostSigma);
 
     progress.advance(33, "Rendering preview");
     QImage preview = renderPreview(composedImage, params, stack.getMaxExposure(), options.previewSize <= 1);
