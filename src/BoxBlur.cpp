@@ -21,6 +21,9 @@
  */
 
 #include <cmath>
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    #include <arm_neon.h>
+#endif
 #include "BoxBlur.hpp"
 
 namespace hdrmerge {
@@ -72,6 +75,45 @@ void BoxBlur::boxBlurH(size_t r) {
 void BoxBlur::boxBlurT(size_t r) {
     float iarr = 1.0 / (r+r+1);
     const int numCols = 8; // process numCols columns at once for better usage of L1 cpu cache
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    float32x4_t viarr = vdupq_n_f32(iarr);
+    #pragma omp parallel for schedule(dynamic,4)
+    for (size_t i = 0; i < width-numCols+1; i+=numCols) {
+        size_t ti = i, li = ti, ri = ti + r*width;
+        float rpf = (float)(r + 1);
+        float32x4_t val_lo = vmulq_n_f32(vld1q_f32(&data[li]), rpf);
+        float32x4_t val_hi = vmulq_n_f32(vld1q_f32(&data[li+4]), rpf);
+        for (size_t j = 0; j < r; ++j) {
+            val_lo = vaddq_f32(val_lo, vld1q_f32(&data[li + j*width]));
+            val_hi = vaddq_f32(val_hi, vld1q_f32(&data[li + j*width + 4]));
+        }
+        for (size_t j = 0; j <= r; ++j) {
+            val_lo = vaddq_f32(val_lo, vsubq_f32(vld1q_f32(&data[ri]), vld1q_f32(&data[li])));
+            val_hi = vaddq_f32(val_hi, vsubq_f32(vld1q_f32(&data[ri+4]), vld1q_f32(&data[li+4])));
+            vst1q_f32(&tmp[ti], vmulq_f32(val_lo, viarr));
+            vst1q_f32(&tmp[ti+4], vmulq_f32(val_hi, viarr));
+            ri += width;
+            ti += width;
+        }
+        for (size_t j = r + 1; j < height - r; ++j) {
+            val_lo = vaddq_f32(val_lo, vsubq_f32(vld1q_f32(&data[ri]), vld1q_f32(&data[li])));
+            val_hi = vaddq_f32(val_hi, vsubq_f32(vld1q_f32(&data[ri+4]), vld1q_f32(&data[li+4])));
+            vst1q_f32(&tmp[ti], vmulq_f32(val_lo, viarr));
+            vst1q_f32(&tmp[ti+4], vmulq_f32(val_hi, viarr));
+            li += width;
+            ri += width;
+            ti += width;
+        }
+        for (size_t j = height - r; j < height; ++j) {
+            val_lo = vaddq_f32(val_lo, vsubq_f32(vld1q_f32(&data[ri - width]), vld1q_f32(&data[li])));
+            val_hi = vaddq_f32(val_hi, vsubq_f32(vld1q_f32(&data[ri - width + 4]), vld1q_f32(&data[li+4])));
+            vst1q_f32(&tmp[ti], vmulq_f32(val_lo, viarr));
+            vst1q_f32(&tmp[ti+4], vmulq_f32(val_hi, viarr));
+            li += width;
+            ti += width;
+        }
+    }
+#else
     #pragma omp parallel for schedule(dynamic,4)
     for (size_t i = 0; i < width-numCols+1; i+=numCols) {
         size_t ti = i, li = ti, ri = ti + r*width;
@@ -108,6 +150,7 @@ void BoxBlur::boxBlurT(size_t r) {
             ti += width;
         }
     }
+#endif
     // process the remaining columns
     for (size_t i = width - (width%numCols); i < width; ++i) {
         size_t ti = i, li = ti, ri = ti + r*width;
