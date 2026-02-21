@@ -30,6 +30,8 @@ namespace hdrmerge {
     namespace Exif {
         void transfer(const QString & srcFile, const QString & dstFile,
                  const uint8_t * data, size_t dataSize);
+        void transferFile(const QString & srcFile, const QString & tmpFile,
+                 const QString & dstFile);
     }
 
 }

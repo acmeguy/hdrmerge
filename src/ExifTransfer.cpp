@@ -80,6 +80,36 @@ void hdrmerge::Exif::transfer(const QString & srcFile, const QString & dstFile,
 }
 
 
+void hdrmerge::Exif::transferFile(const QString & srcFile, const QString & tmpFile,
+                                   const QString & dstFile) {
+    ExivImagePtr dst, src;
+    try {
+        dst = Exiv2::ImageFactory::open(tmpFile.toLocal8Bit().constData());
+        dst->readMetadata();
+    } catch (Exiv2::Error & e) {
+        std::cerr << "Exiv2 error opening temp DNG: " << e.what() << std::endl;
+        return;
+    }
+    try {
+        src = Exiv2::ImageFactory::open(srcFile.toLocal8Bit().constData());
+        src->readMetadata();
+        copyAllMetadata(src, dst);
+    } catch (Exiv2::Error & e) {
+        std::cerr << "Exiv2 error: " << e.what() << std::endl;
+        dst->exifData()["Exif.SubImage1.NewSubfileType"] = 0;
+    }
+    try {
+        dst->writeMetadata();
+        FileIo fileIo(dstFile.toLocal8Bit().constData());
+        fileIo.open("wb");
+        fileIo.write(dst->io());
+        fileIo.close();
+    } catch (Exiv2::Error & e) {
+        std::cerr << "Exiv2 error writing DNG: " << e.what() << std::endl;
+    }
+}
+
+
 static void copyXMP(Exiv2::Image & src, Exiv2::Image & dst) {
     const Exiv2::XmpData & srcXmp = src.xmpData();
     Exiv2::XmpData & dstXmp = dst.xmpData();
