@@ -27,8 +27,10 @@
 #include "Log.hpp"
 #include "RawParameters.hpp"
 
-#ifdef __SSE2__
+#if defined(__SSE2__)
     #include <x86intrin.h>
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    #include <arm_neon.h>
 #endif
 
 using namespace std;
@@ -202,7 +204,189 @@ double ImageStack::value(size_t x, size_t y) const {
     return img.exposureAt(x, y);
 }
 
-#ifndef __SSE2__
+#if defined(__SSE2__)
+// From The GIMP: app/paint-funcs/paint-funcs.c:fatten_region
+// SSE version by Ingo Weyrich
+static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
+    Timer t("Fatten mask (SSE version)");
+    size_t width = mask.getWidth(), height = mask.getHeight();
+    Array2D<uint8_t> result(width, height);
+
+    int circArray[2 * radius + 1]; // holds the y coords of the filter's mask
+    // compute_border(circArray, radius)
+    for (int i = 0; i < radius * 2 + 1; i++) {
+        double tmp;
+        if (i > radius)
+            tmp = (i - radius) - 0.5;
+        else if (i < radius)
+            tmp = (radius - i) - 0.5;
+        else
+            tmp = 0.0;
+        circArray[i] = int(std::sqrt(radius*radius - tmp*tmp));
+    }
+    // offset the circ pointer by radius so the range of the array
+    //     is [-radius] to [radius]
+    int * circ = circArray + radius;
+
+    const uint8_t * bufArray[height + 2*radius];
+    for (int i = 0; i < radius; i++) {
+        bufArray[i] = &mask[0];
+    }
+    for (size_t i = 0; i < height; i++) {
+        bufArray[i + radius] = &mask[i * width];
+    }
+    for (int i = 0; i < radius; i++) {
+        bufArray[i + height + radius] = &mask[(height - 1) * width];
+    }
+    // offset the buf pointer
+    const uint8_t ** buf = bufArray + radius;
+
+    #pragma omp parallel
+    {
+        uint8_t buffer[width * (radius + 1)];
+        uint8_t *maxArray[radius+1];
+        for (int i = 0; i <= radius; i++) {
+            maxArray[i] = &buffer[i*width];
+        }
+
+        #pragma omp for schedule(dynamic,16)
+        for (size_t y = 0; y < height; y++) {
+            size_t x = 0;
+            for (; x < width-15; x+=16) { // compute max array, use SSE to process 16 bytes at once
+                __m128i lmax = _mm_loadu_si128((__m128i*)&buf[y][x]);
+                if(radius<2) // max[0] is only used when radius < 2
+                    _mm_storeu_si128((__m128i*)&maxArray[0][x],lmax);
+                for (int i = 1; i <= radius; i++) {
+                    lmax = _mm_max_epu8(_mm_loadu_si128((__m128i*)&buf[y + i][x]),lmax);
+                    lmax = _mm_max_epu8(_mm_loadu_si128((__m128i*)&buf[y - i][x]),lmax);
+                    _mm_storeu_si128((__m128i*)&maxArray[i][x],lmax);
+                }
+            }
+            for (; x < width; x++) { // compute max array, remaining columns
+                uint8_t lmax = buf[y][x];
+                if(radius<2) // max[0] is only used when radius < 2
+                    maxArray[0][x] = lmax;
+                for (int i = 1; i <= radius; i++) {
+                    lmax = std::max(std::max(lmax, buf[y + i][x]), buf[y - i][x]);
+                    maxArray[i][x] = lmax;
+                }
+            }
+
+            for (x = 0; (int)x < radius; x++) { // render scan line, first columns without SSE
+                uint8_t last_max = maxArray[circ[radius]][x+radius];
+                for (int i = radius - 1; i >= -(int)x; i--)
+                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
+                result(x, y) = last_max;
+            }
+            for (; x < width-15-radius+1; x += 16) { // render scan line, use SSE to process 16 bytes at once
+                __m128i last_maxv = _mm_loadu_si128((__m128i*)&maxArray[circ[radius]][x+radius]);
+                for (int i = radius - 1; i >= -radius; i--)
+                    last_maxv = _mm_max_epu8(last_maxv,_mm_loadu_si128((__m128i*)&maxArray[circ[i]][x+i]));
+                _mm_storeu_si128((__m128i*)&result(x,y),last_maxv);
+            }
+
+            for (; x < width; x++) { // render scan line, last columns without SSE
+                int maxRadius = std::min(radius,(int)((int)width-1-(int)x));
+                uint8_t last_max = maxArray[circ[maxRadius]][x+maxRadius];
+                for (int i = maxRadius-1; i >= -radius; i--)
+                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
+                result(x, y) = last_max;
+            }
+        }
+    }
+
+    return result;
+}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+// NEON version: identical algorithm to SSE2, using ARM NEON intrinsics
+static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
+    Timer t("Fatten mask (NEON version)");
+    size_t width = mask.getWidth(), height = mask.getHeight();
+    Array2D<uint8_t> result(width, height);
+
+    int circArray[2 * radius + 1];
+    for (int i = 0; i < radius * 2 + 1; i++) {
+        double tmp;
+        if (i > radius)
+            tmp = (i - radius) - 0.5;
+        else if (i < radius)
+            tmp = (radius - i) - 0.5;
+        else
+            tmp = 0.0;
+        circArray[i] = int(std::sqrt(radius*radius - tmp*tmp));
+    }
+    int * circ = circArray + radius;
+
+    const uint8_t * bufArray[height + 2*radius];
+    for (int i = 0; i < radius; i++) {
+        bufArray[i] = &mask[0];
+    }
+    for (size_t i = 0; i < height; i++) {
+        bufArray[i + radius] = &mask[i * width];
+    }
+    for (int i = 0; i < radius; i++) {
+        bufArray[i + height + radius] = &mask[(height - 1) * width];
+    }
+    const uint8_t ** buf = bufArray + radius;
+
+    #pragma omp parallel
+    {
+        uint8_t buffer[width * (radius + 1)];
+        uint8_t *maxArray[radius+1];
+        for (int i = 0; i <= radius; i++) {
+            maxArray[i] = &buffer[i*width];
+        }
+
+        #pragma omp for schedule(dynamic,16)
+        for (size_t y = 0; y < height; y++) {
+            size_t x = 0;
+            for (; x < width-15; x+=16) { // compute max array, 16 bytes at a time
+                uint8x16_t lmax = vld1q_u8(&buf[y][x]);
+                if(radius<2)
+                    vst1q_u8(&maxArray[0][x], lmax);
+                for (int i = 1; i <= radius; i++) {
+                    lmax = vmaxq_u8(vld1q_u8(&buf[y + i][x]), lmax);
+                    lmax = vmaxq_u8(vld1q_u8(&buf[y - i][x]), lmax);
+                    vst1q_u8(&maxArray[i][x], lmax);
+                }
+            }
+            for (; x < width; x++) { // remaining columns
+                uint8_t lmax = buf[y][x];
+                if(radius<2)
+                    maxArray[0][x] = lmax;
+                for (int i = 1; i <= radius; i++) {
+                    lmax = std::max(std::max(lmax, buf[y + i][x]), buf[y - i][x]);
+                    maxArray[i][x] = lmax;
+                }
+            }
+
+            for (x = 0; (int)x < radius; x++) { // first columns scalar
+                uint8_t last_max = maxArray[circ[radius]][x+radius];
+                for (int i = radius - 1; i >= -(int)x; i--)
+                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
+                result(x, y) = last_max;
+            }
+            for (; x < width-15-radius+1; x += 16) { // render scan line, 16 bytes at a time
+                uint8x16_t last_maxv = vld1q_u8(&maxArray[circ[radius]][x+radius]);
+                for (int i = radius - 1; i >= -radius; i--)
+                    last_maxv = vmaxq_u8(last_maxv, vld1q_u8(&maxArray[circ[i]][x+i]));
+                vst1q_u8(&result(x,y), last_maxv);
+            }
+
+            for (; x < width; x++) { // last columns scalar
+                int maxRadius = std::min(radius,(int)((int)width-1-(int)x));
+                uint8_t last_max = maxArray[circ[maxRadius]][x+maxRadius];
+                for (int i = maxRadius-1; i >= -radius; i--)
+                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
+                result(x, y) = last_max;
+            }
+        }
+    }
+
+    return result;
+}
+#else
+// Scalar fallback
 // From The GIMP: app/paint-funcs/paint-funcs.c:fatten_region
 static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
     Timer t("Fatten mask");
@@ -293,99 +477,6 @@ static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
                         }
                     result(x, y) = last_max;
                 }
-            }
-        }
-    }
-
-    return result;
-}
-#else // use faster SSE version, crunch 16 bytes at once
-// From The GIMP: app/paint-funcs/paint-funcs.c:fatten_region
-// SSE version by Ingo Weyrich
-static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
-    Timer t("Fatten mask (SSE version)");
-    size_t width = mask.getWidth(), height = mask.getHeight();
-    Array2D<uint8_t> result(width, height);
-
-    int circArray[2 * radius + 1]; // holds the y coords of the filter's mask
-    // compute_border(circArray, radius)
-    for (int i = 0; i < radius * 2 + 1; i++) {
-        double tmp;
-        if (i > radius)
-            tmp = (i - radius) - 0.5;
-        else if (i < radius)
-            tmp = (radius - i) - 0.5;
-        else
-            tmp = 0.0;
-        circArray[i] = int(std::sqrt(radius*radius - tmp*tmp));
-    }
-    // offset the circ pointer by radius so the range of the array
-    //     is [-radius] to [radius]
-    int * circ = circArray + radius;
-
-    const uint8_t * bufArray[height + 2*radius];
-    for (int i = 0; i < radius; i++) {
-        bufArray[i] = &mask[0];
-    }
-    for (size_t i = 0; i < height; i++) {
-        bufArray[i + radius] = &mask[i * width];
-    }
-    for (int i = 0; i < radius; i++) {
-        bufArray[i + height + radius] = &mask[(height - 1) * width];
-    }
-    // offset the buf pointer
-    const uint8_t ** buf = bufArray + radius;
-
-    #pragma omp parallel
-    {
-        uint8_t buffer[width * (radius + 1)];
-        uint8_t *maxArray[radius+1];
-        for (int i = 0; i <= radius; i++) {
-            maxArray[i] = &buffer[i*width];
-        }
-
-        #pragma omp for schedule(dynamic,16)
-        for (size_t y = 0; y < height; y++) {
-            size_t x = 0;
-            for (; x < width-15; x+=16) { // compute max array, use SSE to process 16 bytes at once
-                __m128i lmax = _mm_loadu_si128((__m128i*)&buf[y][x]);
-                if(radius<2) // max[0] is only used when radius < 2
-                    _mm_storeu_si128((__m128i*)&maxArray[0][x],lmax);
-                for (int i = 1; i <= radius; i++) {
-                    lmax = _mm_max_epu8(_mm_loadu_si128((__m128i*)&buf[y + i][x]),lmax);
-                    lmax = _mm_max_epu8(_mm_loadu_si128((__m128i*)&buf[y - i][x]),lmax);
-                    _mm_storeu_si128((__m128i*)&maxArray[i][x],lmax);
-                }
-            }
-            for (; x < width; x++) { // compute max array, remaining columns
-                uint8_t lmax = buf[y][x];
-                if(radius<2) // max[0] is only used when radius < 2
-                    maxArray[0][x] = lmax;
-                for (int i = 1; i <= radius; i++) {
-                    lmax = std::max(std::max(lmax, buf[y + i][x]), buf[y - i][x]);
-                    maxArray[i][x] = lmax;
-                }
-            }
-
-            for (x = 0; (int)x < radius; x++) { // render scan line, first columns without SSE
-                uint8_t last_max = maxArray[circ[radius]][x+radius];
-                for (int i = radius - 1; i >= -(int)x; i--)
-                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
-                result(x, y) = last_max;
-            }
-            for (; x < width-15-radius+1; x += 16) { // render scan line, use SSE to process 16 bytes at once
-                __m128i last_maxv = _mm_loadu_si128((__m128i*)&maxArray[circ[radius]][x+radius]);
-                for (int i = radius - 1; i >= -radius; i--)
-                    last_maxv = _mm_max_epu8(last_maxv,_mm_loadu_si128((__m128i*)&maxArray[circ[i]][x+i]));
-                _mm_storeu_si128((__m128i*)&result(x,y),last_maxv);
-            }
-
-            for (; x < width; x++) { // render scan line, last columns without SSE
-                int maxRadius = std::min(radius,(int)((int)width-1-(int)x));
-                uint8_t last_max = maxArray[circ[maxRadius]][x+maxRadius];
-                for (int i = maxRadius-1; i >= -radius; i--)
-                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
-                result(x, y) = last_max;
             }
         }
     }
