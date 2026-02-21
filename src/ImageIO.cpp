@@ -203,7 +203,8 @@ void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
     params.adjustWhite(stack.getImage(stack.size() - 1));
     ComposeResult composed = stack.compose(params, options.featherRadius,
                                              options.deghostSigma,
-                                             options.clipPercentile);
+                                             options.clipPercentile,
+                                             options.subPixelAlign);
 
     if (options.resizeLong > 0) {
         progress.advance(20, "Resizing image");
@@ -236,6 +237,7 @@ void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
     finalEV = std::max(-10.0, std::min(10.0, finalEV));
     writer.setBaselineExposure(finalEV);
     writer.setBaselineNoise(composed.numImages);
+    writer.setNoiseProfile(composed.noiseProfile, params.colors);
     writer.setACRProfilePath(options.acrProfilePath);
     writer.setAdaptiveCurves(adaptiveCurves);
     writer.write(std::move(composed.image), params, options.fileName);

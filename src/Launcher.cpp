@@ -50,7 +50,7 @@ using namespace std;
 namespace hdrmerge {
 
 static const QStringList rawExtensions = {
-    "*.nef", "*.cr2", "*.cr3", "*.arw", "*.dng", "*.raf", "*.orf", "*.rw2",
+    "*.nef", "*.cr2", "*.cr3", "*.arw", "*.raf", "*.orf", "*.rw2",
     "*.pef", "*.srw", "*.3fr", "*.mrw", "*.raw", "*.sr2", "*.mef", "*.nrw"
 };
 
@@ -161,7 +161,7 @@ static QString applyOutputDir(const QString & fileName, const QString & outputDi
     if (outputDir.isEmpty()) return fileName;
     QDir outDir(outputDir);
     if (outDir.isRelative())
-        outDir.setPath(QDir::currentPath() + "/" + outputDir);
+        outDir.setPath(QFileInfo(fileName).absolutePath() + "/" + outputDir);
     outDir.mkpath(".");
     return outDir.absolutePath() + "/" + QFileInfo(fileName).fileName();
 }
@@ -447,6 +447,8 @@ void Launcher::parseCommandLine() {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
             }
+        } else if (string("--sub-pixel") == argv[i]) {
+            saveOptions.subPixelAlign = true;
         } else if (string("-O") == argv[i] || string("--output-dir") == argv[i]) {
             if (++i < argc) {
                 saveOptions.outputDir = QString::fromLocal8Bit(argv[i]);
@@ -483,6 +485,22 @@ void Launcher::parseCommandLine() {
     if (maxJobs == 0) {
         unsigned int hw = std::thread::hardware_concurrency();
         maxJobs = std::max(1u, hw / 2);
+    }
+    // Default to batch mode when files are provided without explicit output
+    if (!generalOptions.fileNames.empty() && saveOptions.fileName.isEmpty()) {
+        generalOptions.batch = true;
+    }
+    // Default output directory to "merged" subfolder alongside inputs
+    if (saveOptions.outputDir.isEmpty() && saveOptions.fileName.isEmpty()) {
+        saveOptions.outputDir = "merged";
+    }
+    // Auto-load default ACR profile if present alongside the binary
+    if (saveOptions.acrProfilePath.isEmpty()) {
+        QString candidate = QCoreApplication::applicationDirPath() + "/default_profile.xmp";
+        if (QFileInfo::exists(candidate)) {
+            saveOptions.acrProfilePath = candidate;
+            Log::debug("Using default ACR profile: ", candidate);
+        }
     }
 }
 
@@ -530,11 +548,13 @@ void Launcher::showHelp() {
     cout << "    " << "--deghost S   " << tr("Sigma-clipping ghost detection. S is the sigma threshold (e.g. 3.0). 0=off (default).") << endl;
     cout << "    " << "--clip-percentile P " << tr("Normalization percentile (90-100). Default 99.9. Use 100 for legacy behavior.") << endl;
     cout << "    " << "-j N          " << tr("Number of concurrent merge jobs in batch mode. Default: half of CPU cores.") << endl;
-    cout << "    " << "-L PROFILE    " << tr("Apply ACR settings from a Lightroom .xmp preset to output DNGs.") << endl;
+    cout << "    " << "-L PROFILE    " << tr("Apply ACR/Lightroom .xmp preset to output DNGs. Overrides default_profile.xmp.") << endl;
+    cout << "    " << "              " << tr("If default_profile.xmp exists next to the hdrmerge binary, it is used automatically.") << endl;
     cout << "    " << "--auto-curves " << tr("Generate per-image adaptive RGB tone curves via ONNX model.") << endl;
     cout << "    " << "--resize-long N " << tr("Resize output so longest edge is N pixels. CFA-aware Lanczos-3.") << endl;
     cout << "    " << "--ev-shift EV " << tr("Add EV stops to default rendering brightness. Does not change pixel data.") << endl;
     cout << "    " << "--hot-pixel S " << tr("Hot/dead pixel correction. S is the sigma threshold (e.g. 3.0). 0=off (default).") << endl;
+    cout << "    " << "--sub-pixel   " << tr("Apply sub-pixel alignment correction (experimental). Default off.") << endl;
     cout << "    " << "-O|--output-dir DIR " << tr("Write output files to DIR instead of alongside inputs.") << endl;
     cout << "    " << "-d DIR        " << tr("Scan directory for raw files.") << endl;
     cout << "    " << "RAW_FILES     " << tr("The input raw files or directories containing raw files.") << endl;
@@ -575,6 +595,8 @@ bool Launcher::checkGUI() {
             ++i; // skip the value
         } else if (string("--hot-pixel") == argv[i]) {
             ++i; // skip the value
+        } else if (string("--sub-pixel") == argv[i]) {
+            // flag only, no effect on GUI decision
         } else if (string("-O") == argv[i] || string("--output-dir") == argv[i]) {
             ++i; // skip the value
         } else if (string("-d") == argv[i]) {
@@ -596,7 +618,6 @@ int Launcher::run() {
     bool useGUI = checkGUI();
 #else
     bool useGUI = false;
-    help = checkGUI();
 #endif
     QApplication app(argc, argv, useGUI);
 
@@ -617,6 +638,9 @@ int Launcher::run() {
     parseCommandLine();
     Log::debug("Using LibRaw ", libraw_version());
 
+#ifdef NO_GUI
+    if (generalOptions.fileNames.empty()) help = true;
+#endif
     if (help) {
         showHelp();
         return 0;

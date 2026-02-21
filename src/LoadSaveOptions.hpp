@@ -59,10 +59,11 @@ struct SaveOptions {
     float hotPixelSigma;
     bool autoCurves;
     int resizeLong;
+    bool subPixelAlign;
     SaveOptions() : bps(24), previewSize(0), saveMask(false), featherRadius(3),
         compressionLevel(6), deghostSigma(0.0f), clipPercentile(99.9),
         evShift(0.0), hotPixelSigma(0.0f),
-        autoCurves(false), resizeLong(0) {}
+        autoCurves(false), resizeLong(0), subPixelAlign(false) {}
 };
 
 } // namespace hdrmerge

@@ -64,6 +64,9 @@ public:
     double exposureAt(size_t x, size_t y) const {
         return response((*this)(x, y));
     }
+    double exposureForRaw(uint16_t raw) const {
+        return response(raw);
+    }
     uint16_t getMaxAround(size_t x, size_t y) const;
     bool isSaturated(uint16_t v) const {
         return v >= satThreshold;
@@ -89,6 +92,10 @@ public:
     {
         return max;
     }
+    double getFracDx() const { return fracDx; }
+    double getFracDy() const { return fracDy; }
+    void setFracDx(double dx) { fracDx = dx; }
+    void setFracDy(double dy) { fracDy = dy; }
 
 private:
     struct ResponseFunction {
@@ -102,6 +109,7 @@ private:
     };
 
     QString filename;
+    double fracDx = 0.0, fracDy = 0.0;
 
     std::unique_ptr<Array2D<uint16_t>[]> scaled;
     uint16_t satThreshold, max;

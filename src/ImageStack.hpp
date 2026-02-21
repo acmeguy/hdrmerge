@@ -38,6 +38,7 @@ struct ComposeResult {
     Array2D<float> image;
     double baselineExposureEV;  // EV shift for correct default rendering
     int numImages;              // number of merged exposures (for BaselineNoise)
+    double noiseProfile[8] = {};  // 2 doubles per channel (S, O): variance = S*signal + O
 };
 
 class ImageStack {
@@ -57,7 +58,8 @@ public:
     void correctHotPixels(const RawParameters & params, float sigma);
     ComposeResult compose(const RawParameters & md, int featherRadius,
                            float deghostSigma = 0.0f,
-                           double clipPercentile = 99.9) const;
+                           double clipPercentile = 99.9,
+                           bool subPixelAlign = false) const;
 
     size_t size() const { return images.size(); }
 
@@ -118,6 +120,7 @@ private:
     size_t height;
     int flip;
     uint16_t satThreshold;
+    uint16_t satThresholdPerChannel[4];
 };
 
 } // namespace hdrmerge

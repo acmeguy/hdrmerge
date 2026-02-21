@@ -72,6 +72,39 @@ static void injectACRProfile(Exiv2::Image & dst, const QString & profilePath) {
 }
 
 
+static void injectDefaultHDRSettings(Exiv2::Image & dst) {
+    Exiv2::XmpData & xmp = dst.xmpData();
+
+    // setIfAbsent helper: only inject values not already present
+    auto setIfAbsent = [&](const char * key, const std::string & value) {
+        if (xmp.findKey(Exiv2::XmpKey(key)) == xmp.end()) {
+            xmp[key] = value;
+        }
+    };
+
+    setIfAbsent("Xmp.crs.ProcessVersion", "11.0");
+    setIfAbsent("Xmp.crs.HDREditMode", "1");
+    setIfAbsent("Xmp.crs.Highlights2012", "-100");
+    setIfAbsent("Xmp.crs.Shadows2012", "+100");
+    setIfAbsent("Xmp.crs.Whites2012", "-40");
+    setIfAbsent("Xmp.crs.Blacks2012", "+20");
+
+    // Tone curve (XMP seq) — only if not already present
+    const char * curveKey = "Xmp.crs.ToneCurvePV2012";
+    if (xmp.findKey(Exiv2::XmpKey(curveKey)) == xmp.end()) {
+        ExivValuePtr val = Exiv2::Value::create(Exiv2::xmpSeq);
+        val->read("0, 0");
+        val->read("64, 70");
+        val->read("128, 140");
+        val->read("192, 200");
+        val->read("255, 255");
+        xmp.add(Exiv2::XmpKey(curveKey), val.get());
+    }
+
+    setIfAbsent("Xmp.crs.ToneCurveName2012", "Custom");
+}
+
+
 static void injectAdaptiveCurves(Exiv2::Image & dst, const hdrmerge::AdaptiveCurves & curves) {
     if (!curves.valid) return;
     Exiv2::XmpData & xmp = dst.xmpData();
@@ -287,7 +320,9 @@ void hdrmerge::Exif::transferFile(const QString & srcFile, const QString & tmpFi
         std::cerr << "Exiv2 error: " << e.what() << std::endl;
         dst->exifData()["Exif.SubImage1.NewSubfileType"] = 0;
     }
-    // Inject ACR profile (overrides source metadata)
+    // Inject hardcoded HDR defaults (setIfAbsent — won't override existing values)
+    injectDefaultHDRSettings(*dst);
+    // Inject ACR profile (overrides source metadata and defaults)
     injectACRProfile(*dst, acrProfilePath);
     // Inject adaptive curves (overrides profile's curves if present)
     injectAdaptiveCurves(*dst, curves);

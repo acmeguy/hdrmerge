@@ -55,6 +55,11 @@ public:
             ? 1.0 / std::sqrt(static_cast<double>(numImages))
             : 1.0;
     }
+    void setNoiseProfile(const double * profile, int colors) {
+        noiseProfileColors = colors;
+        for (int i = 0; i < colors * 2; ++i)
+            noiseProfileData[i] = profile[i];
+    }
     void setACRProfilePath(const QString & path) { acrProfilePath = path; }
     void setAdaptiveCurves(const AdaptiveCurves & c) { adaptiveCurves = c; }
     void setPreview(const QImage & p);
@@ -67,6 +72,8 @@ private:
     bool useJXL = false;
     double baselineExposureEV = 0.0;
     double baselineNoiseRatio = 1.0;
+    double noiseProfileData[8] = {};
+    int noiseProfileColors = 0;
     QString acrProfilePath;
     AdaptiveCurves adaptiveCurves;
     const RawParameters * params;

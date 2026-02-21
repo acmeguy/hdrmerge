@@ -343,6 +343,11 @@ if(ONNXRUNTIME_LIBRARY)
 endif()
 target_link_libraries(hdrmerge ${STRIP} ${hdrmerge_libs} Qt5::Widgets)
 
+option(NO_GUI "Disable GUI, CLI-only build" OFF)
+if(NO_GUI)
+    target_compile_definitions(hdrmerge PRIVATE NO_GUI)
+endif()
+
 if(WIN32)
     # Compile a target without GUI, for the .com executable
     add_executable(hdrmerge-nogui
