@@ -22,6 +22,7 @@
 
 #include <iostream>
 #include <cmath>
+#include <cstdio>
 #include <vector>
 #include <QBuffer>
 #include <QDateTime>
@@ -146,23 +147,48 @@ void DngFloatWriter::write(Array2D<float> && rawPixels, const RawParameters & p,
         dataOffset += previewIFD.length();
     }
     mainIFD.setValue(SUBIFDS, (const void *)subIFDoffsets);
-    pos = dataOffset;
-    size_t dataSize = dataOffset + thumbSize() + previewSize() + rawSize();
-    fileData.reset(new uint8_t[dataSize]);
 
-    Timer t("Write output");
-    writePreviews();
-    writeRawData();
-    dataSize = pos;
-    pos = 0;
-    TiffHeader().write(fileData.get(), pos);
-    mainIFD.write(fileData.get(), pos, false);
-    rawIFD.write(fileData.get(), pos, false);
-    if (previewWidth > 0) {
-        previewIFD.write(fileData.get(), pos, false);
+    // Open temp file for streaming
+    QString tempPath = dstFileName + ".tmp";
+    FILE * f = fopen(tempPath.toLocal8Bit().constData(), "w+b");
+    if (!f) {
+        std::cerr << "Failed to open temp file: " << tempPath.toLocal8Bit().constData() << std::endl;
+        return;
     }
 
-    Exif::transfer(p.fileName, dstFileName, fileData.get(), dataSize);
+    {
+        Timer t("Write output");
+
+        // Write placeholder for headers + IFDs (will be patched later)
+        std::vector<uint8_t> zeros(dataOffset, 0);
+        fwrite(zeros.data(), 1, dataOffset, f);
+
+        // Write previews directly to file
+        writePreviewsToFile(f, dataOffset);
+
+        // Write compressed tiles directly to file
+        writeRawDataToFile(f);
+    }
+
+    // Release input pixel data (no longer needed)
+    rawData = Array2D<float>();
+
+    // Build final IFD buffer and patch file header
+    std::vector<uint8_t> headerBuf(dataOffset);
+    size_t headerPos = 0;
+    TiffHeader().write(headerBuf.data(), headerPos);
+    mainIFD.write(headerBuf.data(), headerPos, false);
+    rawIFD.write(headerBuf.data(), headerPos, false);
+    if (previewWidth > 0) {
+        previewIFD.write(headerBuf.data(), headerPos, false);
+    }
+
+    fseek(f, 0, SEEK_SET);
+    fwrite(headerBuf.data(), 1, dataOffset, f);
+    fclose(f);
+
+    // Transfer EXIF metadata from source NEF, write final DNG
+    Exif::transferFile(p.fileName, tempPath, dstFileName);
 }
 
 
@@ -372,16 +398,22 @@ size_t DngFloatWriter::previewSize() {
 }
 
 
-void DngFloatWriter::writePreviews() {
+void DngFloatWriter::writePreviewsToFile(FILE * f, size_t dataOffset) {
+    size_t filePos = dataOffset;
+
+    // Thumbnail
     size_t ts = thumbSize();
     mainIFD.setValue(STRIPBYTES, ts);
-    mainIFD.setValue(STRIPOFFSETS, pos);
-    pos = std::copy_n((const uint8_t *)thumbnail.bits(), ts, &fileData[pos]) - fileData.get();
+    mainIFD.setValue(STRIPOFFSETS, (uint32_t)filePos);
+    fwrite(thumbnail.bits(), 1, ts, f);
+    filePos += ts;
+
+    // Preview JPEG
     if (previewWidth > 0) {
-        ts = previewSize();
-        previewIFD.setValue(STRIPBYTES, ts);
-        previewIFD.setValue(STRIPOFFSETS, pos);
-        pos = std::copy_n((const uint8_t *)jpegPreviewData.constData(), ts, &fileData[pos]) - fileData.get();
+        size_t ps = previewSize();
+        previewIFD.setValue(STRIPBYTES, ps);
+        previewIFD.setValue(STRIPOFFSETS, (uint32_t)filePos);
+        fwrite(jpegPreviewData.constData(), 1, ps, f);
     }
 }
 
@@ -524,24 +556,14 @@ static void compressFloats(Bytef * dst, int tileWidth, int bytesps) {
 }
 
 
-size_t DngFloatWriter::rawSize() {
-    // Worst case: DEFLATE can expand data slightly for incompressible input.
-    // Add ~0.1% + 32 bytes per tile for zlib/DEFLATE overhead.
-    size_t uncompressed = tilesAcross * tilesDown * tileWidth * tileLength * (bps >> 3);
-    size_t overhead = tilesAcross * tilesDown * 64;
-    return uncompressed + overhead;
-}
-
-
-void DngFloatWriter::writeRawData() {
+void DngFloatWriter::writeRawDataToFile(FILE * f) {
     size_t tileCount = tilesAcross * tilesDown;
-    uint32_t tileOffsets[tileCount];
-    uint32_t tileBytes[tileCount];
+    std::vector<uint32_t> tileOffsets(tileCount);
+    std::vector<uint32_t> tileByteCounts(tileCount);
     int bytesps = bps >> 3;
     uLongf dstLen = tileWidth * tileLength * bytesps;
 
 #ifdef HAVE_LIBDEFLATE
-    // Create one compressor per thread (libdeflate instances are not thread-safe)
     int nThreads = 1;
     #ifdef _OPENMP
     nThreads = omp_get_max_threads();
@@ -581,14 +603,14 @@ void DngFloatWriter::writeRawData() {
                 #endif
                 size_t compressedLength = libdeflate_zlib_compress(
                     compressors[tid], uBuffer, dstLen, cBuffer, cBufLen);
-                tileBytes[t] = compressedLength;
+                tileByteCounts[t] = compressedLength;
                 if (compressedLength == 0) {
                     std::cerr << "DNG Deflate: Failed compressing tile " << t << std::endl;
                 }
 #else
-                uLongf conpressedLength = dstLen;
-                int err = compress(cBuffer, &conpressedLength, uBuffer, dstLen);
-                tileBytes[t] = conpressedLength;
+                uLongf compressedLength = dstLen;
+                int err = compress(cBuffer, &compressedLength, uBuffer, dstLen);
+                tileByteCounts[t] = compressedLength;
                 if (err != Z_OK) {
                     std::cerr << "DNG Deflate: Failed compressing tile " << t << ", with error " << err << std::endl;
                 }
@@ -596,9 +618,8 @@ void DngFloatWriter::writeRawData() {
                 else {
                     #pragma omp critical
                     {
-                        tileOffsets[t] = pos;
-                        std::copy_n((const uint8_t *)cBuffer, tileBytes[t], &fileData[pos]);
-                        pos += tileBytes[t];
+                        tileOffsets[t] = (uint32_t)ftell(f);
+                        fwrite(cBuffer, 1, tileByteCounts[t], f);
                     }
                 }
             }
@@ -612,8 +633,8 @@ void DngFloatWriter::writeRawData() {
     for (auto c : compressors) libdeflate_free_compressor(c);
 #endif
 
-    rawIFD.setValue(TILEOFFSETS, tileOffsets);
-    rawIFD.setValue(TILEBYTES, tileBytes);
+    rawIFD.setValue(TILEOFFSETS, (const uint32_t *)tileOffsets.data());
+    rawIFD.setValue(TILEBYTES, (const uint32_t *)tileByteCounts.data());
 }
 
 } // namespace hdrmerge

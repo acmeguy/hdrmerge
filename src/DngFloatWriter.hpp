@@ -23,6 +23,7 @@
 #ifndef _DNGFLOATWRITER_HPP_
 #define _DNGFLOATWRITER_HPP_
 
+#include <cstdio>
 #include <QString>
 #include <QImage>
 #include "config.h"
@@ -55,8 +56,6 @@ private:
     int compressionLevel;
     const RawParameters * params;
     Array2D<float> rawData;
-    std::unique_ptr<uint8_t[]> fileData;
-    size_t pos;
     IFD mainIFD, rawIFD, previewIFD;
     uint32_t width, height;
     uint32_t tileWidth, tileLength;
@@ -69,13 +68,12 @@ private:
     void createMainIFD();
     void createRawIFD();
     void calculateTiles();
-    void writeRawData();
+    void writePreviewsToFile(FILE * f, size_t dataOffset);
+    void writeRawDataToFile(FILE * f);
     void renderPreviews();
-    void writePreviews();
     void createPreviewIFD();
     size_t thumbSize();
     size_t previewSize();
-    size_t rawSize();
 };
 
 } // namespace hdrmerge

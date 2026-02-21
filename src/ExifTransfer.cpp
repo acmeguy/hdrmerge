@@ -22,6 +22,7 @@
 
 #include <exiv2/exiv2.hpp>
 #include <iostream>
+#include <QFile>
 #include "ExifTransfer.hpp"
 using namespace hdrmerge;
 using namespace Exiv2;
@@ -100,12 +101,17 @@ void hdrmerge::Exif::transferFile(const QString & srcFile, const QString & tmpFi
     }
     try {
         dst->writeMetadata();
-        FileIo fileIo(dstFile.toLocal8Bit().constData());
-        fileIo.open("wb");
-        fileIo.write(dst->io());
-        fileIo.close();
     } catch (Exiv2::Error & e) {
-        std::cerr << "Exiv2 error writing DNG: " << e.what() << std::endl;
+        std::cerr << "Exiv2 error writing metadata: " << e.what() << std::endl;
+        return;
+    }
+    // Close the image so all writes are flushed to the temp file.
+    dst.reset();
+    // Rename temp file to final destination.
+    QFile::remove(dstFile);
+    if (!QFile::rename(tmpFile, dstFile)) {
+        std::cerr << "Failed to rename " << tmpFile.toLocal8Bit().constData()
+                   << " to " << dstFile.toLocal8Bit().constData() << std::endl;
     }
 }
 
