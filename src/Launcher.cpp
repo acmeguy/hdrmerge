@@ -287,6 +287,8 @@ void Launcher::parseCommandLine() {
             Log::setMinimumPriority(0);
         } else if (string("--no-align") == argv[i]) {
             generalOptions.align = false;
+        } else if (string("--align-features") == argv[i]) {
+            generalOptions.alignFeatures = true;
         } else if (string("--no-crop") == argv[i]) {
             generalOptions.crop = false;
         } else if (string("--batch") == argv[i] || string("-B") == argv[i]) {
@@ -412,6 +414,7 @@ void Launcher::showHelp() {
     cout << "    " << "--single      " << tr("Include single images in batch mode (the default is to skip them.)") << endl;
     cout << "    " << "-b BPS        " << tr("Bits per sample, can be 16, 24 or 32.") << endl;
     cout << "    " << "--no-align    " << tr("Do not auto-align source images.") << endl;
+    cout << "    " << "--align-features " << tr("Use feature-based alignment (requires OpenCV). Falls back to MTB if unavailable.") << endl;
     cout << "    " << "--no-crop     " << tr("Do not crop the output image to the optimum size.") << endl;
     cout << "    " << "-m MASK_FILE  " << tr("Saves the mask to MASK_FILE as a PNG image.") << endl;
     cout << "    " << "              " << tr("Besides the parameters accepted by -o, it also accepts:") << endl;
@@ -443,6 +446,8 @@ bool Launcher::checkGUI() {
             useGUI = false;
         } else if (string("-B") == argv[i]) {
             useGUI = false;
+        } else if (string("--align-features") == argv[i]) {
+            // flag only, no effect on GUI decision
         } else if (string("-c") == argv[i]) {
             ++i; // skip the value
         } else if (string("-j") == argv[i]) {

@@ -44,7 +44,7 @@ public:
     }
 
     int addImage(Image && i);
-    void align();
+    void align(bool useFeatures = false);
     void crop();
     void computeResponseFunctions();
     void generateMask();

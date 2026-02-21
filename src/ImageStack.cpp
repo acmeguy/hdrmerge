@@ -167,8 +167,20 @@ static void measureSubPixelResidual(const Image & ref, const Image & img,
     fracDy = std::max(-0.5, std::min(0.5, fracDy));
 }
 
-void ImageStack::align() {
+void ImageStack::align(bool useFeatures) {
     if (images.size() > 1) {
+#ifdef HAVE_OPENCV
+        if (useFeatures) {
+            Log::progress("Feature-based alignment requested (OpenCV available)");
+            // TODO: Implement AKAZE/ORB feature matching with homography estimation.
+            // For now, fall through to MTB alignment.
+            Log::progress("Feature-based alignment not yet implemented, using MTB");
+        }
+#else
+        if (useFeatures) {
+            Log::progress("Feature-based alignment requested but OpenCV not available, using MTB");
+        }
+#endif
         Timer t("Align");
         size_t errors[images.size()];
         #pragma omp parallel for schedule(dynamic)
