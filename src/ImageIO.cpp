@@ -195,6 +195,7 @@ void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
     progress.advance(66, "Writing output");
     DngFloatWriter writer;
     writer.setBitsPerSample(options.bps);
+    writer.setCompressionLevel(options.compressionLevel);
     writer.setPreviewWidth((options.previewSize * stack.getWidth()) / 2);
     writer.setPreview(preview);
     writer.write(std::move(composedImage), params, options.fileName);

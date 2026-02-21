@@ -508,8 +508,11 @@ static void compressFloats(Bytef * dst, int tileWidth, int bytesps) {
 
 
 size_t DngFloatWriter::rawSize() {
-    // Worst case size
-    return tilesAcross * tilesDown * tileWidth * tileLength * (bps >> 3);
+    // Worst case: DEFLATE can expand data slightly for incompressible input.
+    // Add ~0.1% + 32 bytes per tile for zlib/DEFLATE overhead.
+    size_t uncompressed = tilesAcross * tilesDown * tileWidth * tileLength * (bps >> 3);
+    size_t overhead = tilesAcross * tilesDown * 64;
+    return uncompressed + overhead;
 }
 
 
@@ -528,12 +531,15 @@ void DngFloatWriter::writeRawData() {
     #endif
     std::vector<struct libdeflate_compressor*> compressors(nThreads);
     for (int i = 0; i < nThreads; i++)
-        compressors[i] = libdeflate_alloc_compressor(6);
+        compressors[i] = libdeflate_alloc_compressor(compressionLevel);
+    size_t cBufLen = libdeflate_zlib_compress_bound(compressors[0], dstLen);
+#else
+    size_t cBufLen = dstLen;
 #endif
 
     #pragma omp parallel
     {
-        Bytef * cBuffer = new Bytef[dstLen];
+        Bytef * cBuffer = new Bytef[cBufLen];
         Bytef * uBuffer = new Bytef[dstLen];
 
         #pragma omp for collapse(2) schedule(dynamic)
@@ -557,7 +563,7 @@ void DngFloatWriter::writeRawData() {
                 tid = omp_get_thread_num();
                 #endif
                 size_t compressedLength = libdeflate_zlib_compress(
-                    compressors[tid], uBuffer, dstLen, cBuffer, dstLen);
+                    compressors[tid], uBuffer, dstLen, cBuffer, cBufLen);
                 tileBytes[t] = compressedLength;
                 if (compressedLength == 0) {
                     std::cerr << "DNG Deflate: Failed compressing tile " << t << std::endl;

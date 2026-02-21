@@ -343,6 +343,15 @@ void Launcher::parseCommandLine() {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
             }
+        } else if (string("-c") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    int level = stoi(argv[i]);
+                    saveOptions.compressionLevel = std::min(12, std::max(1, level));
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
         } else if (string("-d") == argv[i]) {
             if (++i < argc) {
                 scanDirectory(QString::fromLocal8Bit(argv[i]), generalOptions.fileNames);
@@ -413,6 +422,7 @@ void Launcher::showHelp() {
     cout << "    " << "-v            " << tr("Verbose mode.") << endl;
     cout << "    " << "-vv           " << tr("Debug mode.") << endl;
     cout << "    " << "-w whitelevel " << tr("Use custom white level.") << endl;
+    cout << "    " << "-c LEVEL      " << tr("DEFLATE compression level 1-12 (1=fastest, 6=default, 12=smallest).") << endl;
     cout << "    " << "-j N          " << tr("Number of concurrent merge jobs in batch mode. Default: half of CPU cores.") << endl;
     cout << "    " << "-d DIR        " << tr("Scan directory for raw files.") << endl;
     cout << "    " << "RAW_FILES     " << tr("The input raw files or directories containing raw files.") << endl;
@@ -433,6 +443,8 @@ bool Launcher::checkGUI() {
             useGUI = false;
         } else if (string("-B") == argv[i]) {
             useGUI = false;
+        } else if (string("-c") == argv[i]) {
+            ++i; // skip the value
         } else if (string("-j") == argv[i]) {
             ++i; // skip the value
         } else if (string("-d") == argv[i]) {

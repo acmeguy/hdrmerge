@@ -35,7 +35,7 @@ class RawParameters;
 
 class DngFloatWriter {
 public:
-    DngFloatWriter() : previewWidth(0), bps(16) {}
+    DngFloatWriter() : previewWidth(0), bps(16), compressionLevel(6) {}
 
     void setPreviewWidth(size_t w) {
         previewWidth = w;
@@ -43,12 +43,16 @@ public:
     void setBitsPerSample(int b) {
         bps = b;
     }
+    void setCompressionLevel(int level) {
+        compressionLevel = level;
+    }
     void setPreview(const QImage & p);
     void write(Array2D<float> && rawPixels, const RawParameters & p, const QString & dstFileName);
 
 private:
     int previewWidth;
     int bps;
+    int compressionLevel;
     const RawParameters * params;
     Array2D<float> rawData;
     std::unique_ptr<uint8_t[]> fileData;
