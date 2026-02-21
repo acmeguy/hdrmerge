@@ -788,9 +788,9 @@ Fill in after each step. Steps 0-9 should produce bit-identical output. Steps 10
 | 0 | Baseline | 5.86s | 117,113,806 | 6.53s | 106,710,316 | 6.32s | 129,106,446 | byte-identical to org/ |
 | 1 | zlib-ng 2.3.3 | 5.51s | 116,870,558 | 6.16s | 106,320,644 | 6.27s | 128,617,186 | pixel-identical (timestamp + compressed bytes differ) |
 | 2 | LibRaw 0.21.4 | — | — | — | — | — | — | no change (already >= 0.21.3) |
-| 3 | libdeflate | | | | | | | pixel-identical |
-| 4 | Byte-shuffle | | | | | | | pixel-identical |
-| 5 | Compression level | | | | | | | |
+| 3 | libdeflate 1.25 | 5.61s | 116,822,792 | 6.55s | 106,663,814 | 6.41s | 128,919,166 | pixel-identical |
+| 4 | Byte-shuffle | — | — | — | — | — | — | SKIPPED: already implemented (DNG FP predictor tag 34894) |
+| 5 | Compression level | 4.56s (-c 6) | 116,822,792 | 5.81s (-c 6) | 106,663,814 | — | — | pixel-identical at all levels |
 
 ### Steps 6-9: ARM64 SIMD
 
@@ -825,10 +825,10 @@ Fill in after each step. Steps 0-9 should produce bit-identical output. Steps 10
 
 | Level | Set A time | Set A size | Set B time | Set B size |
 |-------|-----------|-----------|-----------|-----------|
-| 1 | | | | |
-| 6 | | | | |
-| 9 | | | | |
-| 12 | | | | |
+| 1 | 5.90s | 118,448,148 | 6.30s | 108,429,272 |
+| 6 | 4.56s | 116,822,792 | 5.81s | 106,663,814 |
+| 9 | 4.85s | 116,494,028 | — | — |
+| 12 | 7.16s | 115,379,750 | — | — |
 
 ---
 
@@ -865,9 +865,9 @@ Every actionable finding from `research-modern-hdr-techniques.md` is mapped belo
 | Section 3 | Sub-pixel phase correlation | Step 10 | Planned |
 | Section 3 | Feature-based alignment (ORB/AKAZE) | Step 11 | Planned |
 | Section 4 | zlib-ng drop-in | Step 1 | **Done** (2dc75eb) |
-| Section 4 | libdeflate integration | Step 3 | Planned |
-| Section 4 | Byte-shuffle preprocessing | Step 4 | Planned |
-| Section 4 | Configurable compression level | Step 5 | Planned |
+| Section 4 | libdeflate integration | Step 3 | **Done** (df9cb99) |
+| Section 4 | Byte-shuffle preprocessing | Step 4 | **Skipped** (already implemented as DNG FP predictor) |
+| Section 4 | Configurable compression level | Step 5 | **Done** (9cd3485) |
 | Section 5 | DNG 1.7 / JPEG XL | Step 15 | Deferred (ecosystem) |
 | Section 6 | LibRaw upgrade | Step 2 | **Done** (0.21.4 verified) |
 | Section 7 | NEON fattenMask | Step 6 | Planned |
