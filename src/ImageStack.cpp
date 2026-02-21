@@ -27,8 +27,10 @@
 #include "Log.hpp"
 #include "RawParameters.hpp"
 
-#ifdef __SSE2__
+#if defined(__SSE2__)
     #include <x86intrin.h>
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    #include <arm_neon.h>
 #endif
 
 using namespace std;
@@ -123,8 +125,62 @@ void ImageStack::calculateSaturationLevel(const RawParameters & params, bool use
 }
 
 
-void ImageStack::align() {
+// Compute sub-pixel alignment residual between two integer-aligned images.
+// Uses SSD (sum of squared differences) at 5 offsets with parabolic fitting.
+// Only for diagnostic logging — compositing uses integer shifts.
+static void measureSubPixelResidual(const Image & ref, const Image & img,
+                                     size_t width, size_t height,
+                                     double & fracDx, double & fracDy) {
+    // Compute mean SSD at a given additional offset (ox, oy) relative to current alignment.
+    // Subsample every 4th pixel for speed.
+    auto computeSSD = [&](int ox, int oy) -> double {
+        double ssd = 0;
+        size_t count = 0;
+        int margin = 2;
+        for (size_t y = margin; y < height - margin; y += 4) {
+            for (size_t x = margin; x < width - margin; x += 4) {
+                int rx = (int)x, ry = (int)y;
+                int ix = rx + ox, iy = ry + oy;
+                if (ref.contains(rx, ry) && img.contains(ix, iy)) {
+                    double d = (double)ref(rx, ry) - (double)img(ix, iy);
+                    ssd += d * d;
+                    ++count;
+                }
+            }
+        }
+        return count > 0 ? ssd / count : 1e18;
+    };
+
+    double c = computeSSD(0, 0);
+    double l = computeSSD(-1, 0);
+    double r = computeSSD(1, 0);
+    double u = computeSSD(0, -1);
+    double d = computeSSD(0, 1);
+
+    // Parabolic interpolation: vertex of y = ax^2 + bx + c at x = -b/(2a)
+    double denom_x = l + r - 2.0 * c;
+    double denom_y = u + d - 2.0 * c;
+    fracDx = (denom_x != 0.0) ? (l - r) / (2.0 * denom_x) : 0.0;
+    fracDy = (denom_y != 0.0) ? (u - d) / (2.0 * denom_y) : 0.0;
+    // Clamp to [-0.5, 0.5] — larger values indicate the parabola fit is unreliable
+    fracDx = std::max(-0.5, std::min(0.5, fracDx));
+    fracDy = std::max(-0.5, std::min(0.5, fracDy));
+}
+
+void ImageStack::align(bool useFeatures) {
     if (images.size() > 1) {
+#ifdef HAVE_OPENCV
+        if (useFeatures) {
+            Log::progress("Feature-based alignment requested (OpenCV available)");
+            // TODO: Implement AKAZE/ORB feature matching with homography estimation.
+            // For now, fall through to MTB alignment.
+            Log::progress("Feature-based alignment not yet implemented, using MTB");
+        }
+#else
+        if (useFeatures) {
+            Log::progress("Feature-based alignment requested but OpenCV not available, using MTB");
+        }
+#endif
         Timer t("Align");
         size_t errors[images.size()];
         #pragma omp parallel for schedule(dynamic)
@@ -142,6 +198,12 @@ void ImageStack::align() {
         }
         for (auto & i : images) {
             i.releaseAlignData();
+        }
+        // Measure sub-pixel alignment residuals (diagnostic only)
+        for (size_t i = 0; i < images.size() - 1; ++i) {
+            double fracDx, fracDy;
+            measureSubPixelResidual(images[i + 1], images[i], width, height, fracDx, fracDy);
+            Log::debug("Image ", i, " sub-pixel residual: (", fracDx, ", ", fracDy, ") px");
         }
     }
 }
@@ -202,7 +264,189 @@ double ImageStack::value(size_t x, size_t y) const {
     return img.exposureAt(x, y);
 }
 
-#ifndef __SSE2__
+#if defined(__SSE2__)
+// From The GIMP: app/paint-funcs/paint-funcs.c:fatten_region
+// SSE version by Ingo Weyrich
+static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
+    Timer t("Fatten mask (SSE version)");
+    size_t width = mask.getWidth(), height = mask.getHeight();
+    Array2D<uint8_t> result(width, height);
+
+    int circArray[2 * radius + 1]; // holds the y coords of the filter's mask
+    // compute_border(circArray, radius)
+    for (int i = 0; i < radius * 2 + 1; i++) {
+        double tmp;
+        if (i > radius)
+            tmp = (i - radius) - 0.5;
+        else if (i < radius)
+            tmp = (radius - i) - 0.5;
+        else
+            tmp = 0.0;
+        circArray[i] = int(std::sqrt(radius*radius - tmp*tmp));
+    }
+    // offset the circ pointer by radius so the range of the array
+    //     is [-radius] to [radius]
+    int * circ = circArray + radius;
+
+    const uint8_t * bufArray[height + 2*radius];
+    for (int i = 0; i < radius; i++) {
+        bufArray[i] = &mask[0];
+    }
+    for (size_t i = 0; i < height; i++) {
+        bufArray[i + radius] = &mask[i * width];
+    }
+    for (int i = 0; i < radius; i++) {
+        bufArray[i + height + radius] = &mask[(height - 1) * width];
+    }
+    // offset the buf pointer
+    const uint8_t ** buf = bufArray + radius;
+
+    #pragma omp parallel
+    {
+        uint8_t buffer[width * (radius + 1)];
+        uint8_t *maxArray[radius+1];
+        for (int i = 0; i <= radius; i++) {
+            maxArray[i] = &buffer[i*width];
+        }
+
+        #pragma omp for schedule(dynamic,16)
+        for (size_t y = 0; y < height; y++) {
+            size_t x = 0;
+            for (; x < width-15; x+=16) { // compute max array, use SSE to process 16 bytes at once
+                __m128i lmax = _mm_loadu_si128((__m128i*)&buf[y][x]);
+                if(radius<2) // max[0] is only used when radius < 2
+                    _mm_storeu_si128((__m128i*)&maxArray[0][x],lmax);
+                for (int i = 1; i <= radius; i++) {
+                    lmax = _mm_max_epu8(_mm_loadu_si128((__m128i*)&buf[y + i][x]),lmax);
+                    lmax = _mm_max_epu8(_mm_loadu_si128((__m128i*)&buf[y - i][x]),lmax);
+                    _mm_storeu_si128((__m128i*)&maxArray[i][x],lmax);
+                }
+            }
+            for (; x < width; x++) { // compute max array, remaining columns
+                uint8_t lmax = buf[y][x];
+                if(radius<2) // max[0] is only used when radius < 2
+                    maxArray[0][x] = lmax;
+                for (int i = 1; i <= radius; i++) {
+                    lmax = std::max(std::max(lmax, buf[y + i][x]), buf[y - i][x]);
+                    maxArray[i][x] = lmax;
+                }
+            }
+
+            for (x = 0; (int)x < radius; x++) { // render scan line, first columns without SSE
+                uint8_t last_max = maxArray[circ[radius]][x+radius];
+                for (int i = radius - 1; i >= -(int)x; i--)
+                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
+                result(x, y) = last_max;
+            }
+            for (; x < width-15-radius+1; x += 16) { // render scan line, use SSE to process 16 bytes at once
+                __m128i last_maxv = _mm_loadu_si128((__m128i*)&maxArray[circ[radius]][x+radius]);
+                for (int i = radius - 1; i >= -radius; i--)
+                    last_maxv = _mm_max_epu8(last_maxv,_mm_loadu_si128((__m128i*)&maxArray[circ[i]][x+i]));
+                _mm_storeu_si128((__m128i*)&result(x,y),last_maxv);
+            }
+
+            for (; x < width; x++) { // render scan line, last columns without SSE
+                int maxRadius = std::min(radius,(int)((int)width-1-(int)x));
+                uint8_t last_max = maxArray[circ[maxRadius]][x+maxRadius];
+                for (int i = maxRadius-1; i >= -radius; i--)
+                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
+                result(x, y) = last_max;
+            }
+        }
+    }
+
+    return result;
+}
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+// NEON version: identical algorithm to SSE2, using ARM NEON intrinsics
+static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
+    Timer t("Fatten mask (NEON version)");
+    size_t width = mask.getWidth(), height = mask.getHeight();
+    Array2D<uint8_t> result(width, height);
+
+    int circArray[2 * radius + 1];
+    for (int i = 0; i < radius * 2 + 1; i++) {
+        double tmp;
+        if (i > radius)
+            tmp = (i - radius) - 0.5;
+        else if (i < radius)
+            tmp = (radius - i) - 0.5;
+        else
+            tmp = 0.0;
+        circArray[i] = int(std::sqrt(radius*radius - tmp*tmp));
+    }
+    int * circ = circArray + radius;
+
+    const uint8_t * bufArray[height + 2*radius];
+    for (int i = 0; i < radius; i++) {
+        bufArray[i] = &mask[0];
+    }
+    for (size_t i = 0; i < height; i++) {
+        bufArray[i + radius] = &mask[i * width];
+    }
+    for (int i = 0; i < radius; i++) {
+        bufArray[i + height + radius] = &mask[(height - 1) * width];
+    }
+    const uint8_t ** buf = bufArray + radius;
+
+    #pragma omp parallel
+    {
+        uint8_t buffer[width * (radius + 1)];
+        uint8_t *maxArray[radius+1];
+        for (int i = 0; i <= radius; i++) {
+            maxArray[i] = &buffer[i*width];
+        }
+
+        #pragma omp for schedule(dynamic,16)
+        for (size_t y = 0; y < height; y++) {
+            size_t x = 0;
+            for (; x < width-15; x+=16) { // compute max array, 16 bytes at a time
+                uint8x16_t lmax = vld1q_u8(&buf[y][x]);
+                if(radius<2)
+                    vst1q_u8(&maxArray[0][x], lmax);
+                for (int i = 1; i <= radius; i++) {
+                    lmax = vmaxq_u8(vld1q_u8(&buf[y + i][x]), lmax);
+                    lmax = vmaxq_u8(vld1q_u8(&buf[y - i][x]), lmax);
+                    vst1q_u8(&maxArray[i][x], lmax);
+                }
+            }
+            for (; x < width; x++) { // remaining columns
+                uint8_t lmax = buf[y][x];
+                if(radius<2)
+                    maxArray[0][x] = lmax;
+                for (int i = 1; i <= radius; i++) {
+                    lmax = std::max(std::max(lmax, buf[y + i][x]), buf[y - i][x]);
+                    maxArray[i][x] = lmax;
+                }
+            }
+
+            for (x = 0; (int)x < radius; x++) { // first columns scalar
+                uint8_t last_max = maxArray[circ[radius]][x+radius];
+                for (int i = radius - 1; i >= -(int)x; i--)
+                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
+                result(x, y) = last_max;
+            }
+            for (; x < width-15-radius+1; x += 16) { // render scan line, 16 bytes at a time
+                uint8x16_t last_maxv = vld1q_u8(&maxArray[circ[radius]][x+radius]);
+                for (int i = radius - 1; i >= -radius; i--)
+                    last_maxv = vmaxq_u8(last_maxv, vld1q_u8(&maxArray[circ[i]][x+i]));
+                vst1q_u8(&result(x,y), last_maxv);
+            }
+
+            for (; x < width; x++) { // last columns scalar
+                int maxRadius = std::min(radius,(int)((int)width-1-(int)x));
+                uint8_t last_max = maxArray[circ[maxRadius]][x+maxRadius];
+                for (int i = maxRadius-1; i >= -radius; i--)
+                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
+                result(x, y) = last_max;
+            }
+        }
+    }
+
+    return result;
+}
+#else
+// Scalar fallback
 // From The GIMP: app/paint-funcs/paint-funcs.c:fatten_region
 static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
     Timer t("Fatten mask");
@@ -299,102 +543,9 @@ static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
 
     return result;
 }
-#else // use faster SSE version, crunch 16 bytes at once
-// From The GIMP: app/paint-funcs/paint-funcs.c:fatten_region
-// SSE version by Ingo Weyrich
-static Array2D<uint8_t> fattenMask(const Array2D<uint8_t> & mask, int radius) {
-    Timer t("Fatten mask (SSE version)");
-    size_t width = mask.getWidth(), height = mask.getHeight();
-    Array2D<uint8_t> result(width, height);
-
-    int circArray[2 * radius + 1]; // holds the y coords of the filter's mask
-    // compute_border(circArray, radius)
-    for (int i = 0; i < radius * 2 + 1; i++) {
-        double tmp;
-        if (i > radius)
-            tmp = (i - radius) - 0.5;
-        else if (i < radius)
-            tmp = (radius - i) - 0.5;
-        else
-            tmp = 0.0;
-        circArray[i] = int(std::sqrt(radius*radius - tmp*tmp));
-    }
-    // offset the circ pointer by radius so the range of the array
-    //     is [-radius] to [radius]
-    int * circ = circArray + radius;
-
-    const uint8_t * bufArray[height + 2*radius];
-    for (int i = 0; i < radius; i++) {
-        bufArray[i] = &mask[0];
-    }
-    for (size_t i = 0; i < height; i++) {
-        bufArray[i + radius] = &mask[i * width];
-    }
-    for (int i = 0; i < radius; i++) {
-        bufArray[i + height + radius] = &mask[(height - 1) * width];
-    }
-    // offset the buf pointer
-    const uint8_t ** buf = bufArray + radius;
-
-    #pragma omp parallel
-    {
-        uint8_t buffer[width * (radius + 1)];
-        uint8_t *maxArray[radius+1];
-        for (int i = 0; i <= radius; i++) {
-            maxArray[i] = &buffer[i*width];
-        }
-
-        #pragma omp for schedule(dynamic,16)
-        for (size_t y = 0; y < height; y++) {
-            size_t x = 0;
-            for (; x < width-15; x+=16) { // compute max array, use SSE to process 16 bytes at once
-                __m128i lmax = _mm_loadu_si128((__m128i*)&buf[y][x]);
-                if(radius<2) // max[0] is only used when radius < 2
-                    _mm_storeu_si128((__m128i*)&maxArray[0][x],lmax);
-                for (int i = 1; i <= radius; i++) {
-                    lmax = _mm_max_epu8(_mm_loadu_si128((__m128i*)&buf[y + i][x]),lmax);
-                    lmax = _mm_max_epu8(_mm_loadu_si128((__m128i*)&buf[y - i][x]),lmax);
-                    _mm_storeu_si128((__m128i*)&maxArray[i][x],lmax);
-                }
-            }
-            for (; x < width; x++) { // compute max array, remaining columns
-                uint8_t lmax = buf[y][x];
-                if(radius<2) // max[0] is only used when radius < 2
-                    maxArray[0][x] = lmax;
-                for (int i = 1; i <= radius; i++) {
-                    lmax = std::max(std::max(lmax, buf[y + i][x]), buf[y - i][x]);
-                    maxArray[i][x] = lmax;
-                }
-            }
-
-            for (x = 0; (int)x < radius; x++) { // render scan line, first columns without SSE
-                uint8_t last_max = maxArray[circ[radius]][x+radius];
-                for (int i = radius - 1; i >= -(int)x; i--)
-                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
-                result(x, y) = last_max;
-            }
-            for (; x < width-15-radius+1; x += 16) { // render scan line, use SSE to process 16 bytes at once
-                __m128i last_maxv = _mm_loadu_si128((__m128i*)&maxArray[circ[radius]][x+radius]);
-                for (int i = radius - 1; i >= -radius; i--)
-                    last_maxv = _mm_max_epu8(last_maxv,_mm_loadu_si128((__m128i*)&maxArray[circ[i]][x+i]));
-                _mm_storeu_si128((__m128i*)&result(x,y),last_maxv);
-            }
-
-            for (; x < width; x++) { // render scan line, last columns without SSE
-                int maxRadius = std::min(radius,(int)((int)width-1-(int)x));
-                uint8_t last_max = maxArray[circ[maxRadius]][x+maxRadius];
-                for (int i = maxRadius-1; i >= -radius; i--)
-                    last_max = std::max(last_max,maxArray[circ[i]][x + i]);
-                result(x, y) = last_max;
-            }
-        }
-    }
-
-    return result;
-}
 #endif
 
-Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadius) const {
+Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma) const {
     int imageMax = images.size() - 1;
     BoxBlur map(fattenMask(mask, featherRadius));
     measureTime("Blur", [&] () {
@@ -405,43 +556,112 @@ Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadi
     dst.displace(-(int)params.leftMargin, -(int)params.topMargin);
     dst.fillBorders(0.f);
 
+    // Poisson-optimal merge: weight each exposure by 1/relativeExposure (∝ exposure time).
+    // This is the MLE weight for Poisson noise — longer exposures captured more photons
+    // and thus have lower relative noise, so they get higher weight.
+    const int numImages = (int)images.size();
+    std::vector<double> baseWeight(numImages);
+    for (int k = 0; k < numImages; k++) {
+        baseWeight[k] = 1.0 / images[k].getRelativeExposure();
+    }
+
+    // Soft saturation rolloff: smoothly reduce weight as raw values approach saturation.
+    // This prevents hard edges at saturation boundaries.
+    const double satRolloff = 0.9 * satThreshold;
+    const double satRolloffRange = satThreshold - satRolloff;
+
+    const bool deghost = deghostSigma > 0.0f && numImages >= 3;
+    if (deghost) {
+        Log::debug("Ghost detection enabled: sigma=", deghostSigma);
+    }
+
     float maxVal = 0.0;
-    double saturatedRange = params.max - satThreshold;
     #pragma omp parallel for schedule(dynamic,16) reduction(max:maxVal)
     for (size_t y = 0; y < height; ++y) {
+        // Per-thread stack arrays (max 10 exposures is generous)
+        double radiances[10];
+        double weights[10];
+        double absDevs[10];
+
         for (size_t x = 0; x < width; ++x) {
-            double v, vv;
-            double p = map(x,y);
-            p = p < 0.0 ? 0.0 : p;
-            int j = p;
-            if (images[j].contains(x, y)) {
-                p = p - j;
-                v = images[j].exposureAt(x, y);
-                // Adjust false highlights
-                if (j < origMask(x,y)) { // SaturatedAround
-                    v /= params.whiteMultAt(x, y);
-                    if(p > 0.0001) {
-                        uint16_t rawV = images[j].getMaxAround(x, y);
-                        double k = (rawV - satThreshold) / saturatedRange;
-                        if (k > 1.0)
-                            k = 1.0;
-                        p += (1.0 - p) * k;
+            int numValid = 0;
+
+            // Collect valid exposures with their radiances and weights
+            for (int k = 0; k <= imageMax; k++) {
+                if (!images[k].contains(x, y)) continue;
+                uint16_t raw = images[k](x, y);
+
+                if (raw < 1) continue;
+                if (raw >= satThreshold) continue;
+
+                double w = baseWeight[k];
+                if (raw > satRolloff) {
+                    double t = (satThreshold - raw) / satRolloffRange;
+                    w *= t * t; // Quadratic rolloff
+                }
+
+                double radiance = images[k].exposureAt(x, y);
+                if (radiance <= 0.0) continue;
+
+                radiances[numValid] = radiance;
+                weights[numValid] = w;
+                numValid++;
+                if (numValid >= 10) break;
+            }
+
+            // Sigma-clipping ghost detection: reject outlier exposures
+            // using MAD (median absolute deviation) before weighted merge
+            if (deghost && numValid >= 3) {
+                // Find median radiance (partial sort)
+                double sorted[10];
+                for (int i = 0; i < numValid; i++) sorted[i] = radiances[i];
+                std::nth_element(sorted, sorted + numValid / 2, sorted + numValid);
+                double median = sorted[numValid / 2];
+
+                // Compute MAD
+                for (int i = 0; i < numValid; i++)
+                    absDevs[i] = std::abs(radiances[i] - median);
+                std::nth_element(absDevs, absDevs + numValid / 2, absDevs + numValid);
+                double mad = absDevs[numValid / 2] * 1.4826; // MAD to sigma
+
+                // Reject outliers (set weight to 0)
+                if (mad > 0.0) {
+                    double threshold = deghostSigma * mad;
+                    for (int i = 0; i < numValid; i++) {
+                        if (std::abs(radiances[i] - median) > threshold) {
+                            weights[i] = 0.0;
+                        }
                     }
                 }
-            } else {
-                v = 0.0;
-                p = 1.0;
             }
-            if (p > 0.0001 && j < imageMax && images[j + 1].contains(x, y)) {
-                vv = images[j + 1].exposureAt(x, y);
-                if (j + 1 < origMask(x,y)) { // SaturatedAround
-                    vv /= params.whiteMultAt(x, y);
+
+            // Weighted merge of surviving exposures
+            double weightedSum = 0.0;
+            double totalWeight = 0.0;
+            for (int i = 0; i < numValid; i++) {
+                weightedSum += weights[i] * radiances[i];
+                totalWeight += weights[i];
+            }
+
+            double v;
+            if (totalWeight > 0.0) {
+                v = weightedSum / totalWeight;
+            } else {
+                // All exposures saturated or unavailable — fall back to mask-based selection
+                double p = map(x,y);
+                p = p < 0.0 ? 0.0 : p;
+                int j = (int)p;
+                if (j > imageMax) j = imageMax;
+                if (images[j].contains(x, y)) {
+                    v = images[j].exposureAt(x, y);
+                    if (j < (int)origMask(x,y)) {
+                        v /= params.whiteMultAt(x, y);
+                    }
+                } else {
+                    v = 0.0;
                 }
-            } else {
-                vv = 0.0;
-                p = 0.0;
             }
-            v -= p * (v - vv);
+
             dst(x, y) = v;
             if (v > maxVal) {
                 maxVal = v;

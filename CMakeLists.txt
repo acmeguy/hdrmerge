@@ -45,8 +45,26 @@ add_definitions(${QT_DEFINITIONS})
 
 find_package(LibRaw REQUIRED)
 find_package(Exiv2 REQUIRED)
+# libdeflate for fast DEFLATE compression in DNG writer
+find_library(LIBDEFLATE_LIBRARY deflate PATHS /opt/homebrew/lib)
+find_path(LIBDEFLATE_INCLUDE_DIR libdeflate.h PATHS /opt/homebrew/include)
+if(LIBDEFLATE_LIBRARY AND LIBDEFLATE_INCLUDE_DIR)
+    message(STATUS "Found libdeflate: ${LIBDEFLATE_LIBRARY}")
+    add_definitions(-DHAVE_LIBDEFLATE)
+else()
+    message(STATUS "libdeflate not found, falling back to zlib")
+endif()
 find_package(ZLIB REQUIRED)
 find_package(OpenMP)
+
+# Optional: OpenCV for feature-based alignment (--align-features)
+find_package(OpenCV QUIET COMPONENTS core features2d calib3d imgproc)
+if(OpenCV_FOUND)
+    message(STATUS "Found OpenCV ${OpenCV_VERSION}: feature-based alignment available")
+    add_definitions(-DHAVE_OPENCV)
+else()
+    message(STATUS "OpenCV not found: feature-based alignment disabled (MTB only)")
+endif()
 
 # Commented-out as it doesn't link
 #find_package(Boost 1.46 COMPONENTS unit_test_framework)
@@ -62,6 +80,7 @@ include_directories(
     "${EXIV2_INCLUDE_DIR}"
     "${ZLIB_INCLUDE_DIRS}"
     "${ALGLIB_INCLUDES}"
+    "${LIBDEFLATE_INCLUDE_DIR}"
 )
 
 if(NOT(CMAKE_BUILD_TYPE))
@@ -194,6 +213,7 @@ set(hdrmerge_libs
     "${LibRaw_r_LIBRARIES}"
     "${EXIV2_LIBRARY}"
     "${ZLIB_LIBRARIES}"
+    "${LIBDEFLATE_LIBRARY}"
 )
 
 if(WIN32)
@@ -278,6 +298,9 @@ else()
     )
 endif()
 
+if(OpenCV_FOUND)
+    set(hdrmerge_libs ${hdrmerge_libs} ${OpenCV_LIBS})
+endif()
 target_link_libraries(hdrmerge ${STRIP} ${hdrmerge_libs} Qt5::Widgets)
 
 if(WIN32)

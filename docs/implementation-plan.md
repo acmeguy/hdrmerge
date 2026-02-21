@@ -785,21 +785,21 @@ Fill in after each step. Steps 0-9 should produce bit-identical output. Steps 10
 
 | Step | Description | Set A time | Set A size | Set B time | Set B size | Set C time | Set C size | Identical to prev |
 |------|-------------|-----------|-----------|-----------|-----------|-----------|-----------|-------------------|
-| 0 | Baseline | | | | | | | vs org/ |
-| 1 | zlib-ng | | | | | | | |
-| 2 | LibRaw upgrade | | | | | | | |
-| 3 | libdeflate | | | | | | | pixel-identical |
-| 4 | Byte-shuffle | | | | | | | pixel-identical |
-| 5 | Compression level | | | | | | | |
+| 0 | Baseline | 5.86s | 117,113,806 | 6.53s | 106,710,316 | 6.32s | 129,106,446 | byte-identical to org/ |
+| 1 | zlib-ng 2.3.3 | 5.51s | 116,870,558 | 6.16s | 106,320,644 | 6.27s | 128,617,186 | pixel-identical (timestamp + compressed bytes differ) |
+| 2 | LibRaw 0.21.4 | — | — | — | — | — | — | no change (already >= 0.21.3) |
+| 3 | libdeflate 1.25 | 5.61s | 116,822,792 | 6.55s | 106,663,814 | 6.41s | 128,919,166 | pixel-identical |
+| 4 | Byte-shuffle | — | — | — | — | — | — | SKIPPED: already implemented (DNG FP predictor tag 34894) |
+| 5 | Compression level | 4.56s (-c 6) | 116,822,792 | 5.81s (-c 6) | 106,663,814 | — | — | pixel-identical at all levels |
 
 ### Steps 6-9: ARM64 SIMD
 
 | Step | Description | Set A time | Set B time | Set C time | Identical to prev | Speedup vs prev |
 |------|-------------|-----------|-----------|-----------|-------------------|----------------|
-| 6 | NEON fattenMask | | | | | |
-| 7 | NEON float2half | | | | | |
-| 8 | NEON box blur | | | | | |
-| 9 | vImage eval | | | | see notes | |
+| 6 | NEON fattenMask | 5.30s | 6.01s | 6.04s | pixel-identical | ~1.05x vs step 5 |
+| 7 | NEON float2half | 5.84s | 7.23s | 6.50s | pixel-identical (32-bit); 16-bit uses vcvt_f16_f32 | N/A (no-op at -b 32) |
+| 8 | NEON box blur | 5.46s | 6.25s | 6.12s | pixel-identical | ~1.0x (compiler likely auto-vectorized before) |
+| 9 | vImage eval | — | — | — | N/A | vImage f16 1.28x faster per tile but only ~0.6ms total; dilate/blur not drop-in replacements |
 
 ### Steps 10-11: Alignment
 
@@ -810,10 +810,10 @@ Fill in after each step. Steps 0-9 should produce bit-identical output. Steps 10
 
 ### Steps 12-13: Algorithm
 
-| Step | Description | Set A time | Set A size | Visual quality | Opens in LR |
-|------|-------------|-----------|-----------|---------------|------------|
-| 12 | Noise-optimal merge | | | | |
-| 13 | Ghost detection | | | | |
+| Step | Description | Set A time | Set A size | Set B time | Set B size | Set C time | Set C size | Visual quality | Opens in LR |
+|------|-------------|-----------|-----------|-----------|-----------|-----------|-----------|---------------|------------|
+| 12 | Noise-optimal merge | 5.59s | 115,242,018 | 6.41s | 105,310,804 | 6.24s | 126,385,818 | TBD (verify in LR) | TBD |
+| 13 | Ghost detection (--deghost 3.0) | 5.18s | 117,167,020 | 6.12s | 105,633,756 | 6.61s | 126,869,554 | TBD (verify in LR) | TBD |
 
 ### Step 14: I/O
 
@@ -825,10 +825,10 @@ Fill in after each step. Steps 0-9 should produce bit-identical output. Steps 10
 
 | Level | Set A time | Set A size | Set B time | Set B size |
 |-------|-----------|-----------|-----------|-----------|
-| 1 | | | | |
-| 6 | | | | |
-| 9 | | | | |
-| 12 | | | | |
+| 1 | 5.90s | 118,448,148 | 6.30s | 108,429,272 |
+| 6 | 4.56s | 116,822,792 | 5.81s | 106,663,814 |
+| 9 | 4.85s | 116,494,028 | — | — |
+| 12 | 7.16s | 115,379,750 | — | — |
 
 ---
 
@@ -860,20 +860,20 @@ Every actionable finding from `research-modern-hdr-techniques.md` is mapped belo
 
 | Research Section | Finding | Plan Step | Status |
 |-----------------|---------|-----------|--------|
-| Section 1 | Noise-optimal merge (Poisson) | Step 12 | Planned |
-| Section 2 | Sigma-clipping ghost detection | Step 13 | Planned |
+| Section 1 | Noise-optimal merge (Poisson) | Step 12 | **Done** |
+| Section 2 | Sigma-clipping ghost detection | Step 13 | **Done** |
 | Section 3 | Sub-pixel phase correlation | Step 10 | Planned |
 | Section 3 | Feature-based alignment (ORB/AKAZE) | Step 11 | Planned |
-| Section 4 | zlib-ng drop-in | Step 1 | Planned |
-| Section 4 | libdeflate integration | Step 3 | Planned |
-| Section 4 | Byte-shuffle preprocessing | Step 4 | Planned |
-| Section 4 | Configurable compression level | Step 5 | Planned |
+| Section 4 | zlib-ng drop-in | Step 1 | **Done** (2dc75eb) |
+| Section 4 | libdeflate integration | Step 3 | **Done** (df9cb99) |
+| Section 4 | Byte-shuffle preprocessing | Step 4 | **Skipped** (already implemented as DNG FP predictor) |
+| Section 4 | Configurable compression level | Step 5 | **Done** (9cd3485) |
 | Section 5 | DNG 1.7 / JPEG XL | Step 15 | Deferred (ecosystem) |
-| Section 6 | LibRaw upgrade | Step 2 | Planned |
-| Section 7 | NEON fattenMask | Step 6 | Planned |
-| Section 7 | NEON float-to-half | Step 7 | Planned |
-| Section 7 | NEON box blur | Step 8 | Planned |
-| Section 7 | Apple Accelerate vImage | Step 9 | Planned (eval) |
+| Section 6 | LibRaw upgrade | Step 2 | **Done** (0.21.4 verified) |
+| Section 7 | NEON fattenMask | Step 6 | **Done** (04d71ee) |
+| Section 7 | NEON float-to-half | Step 7 | **Done** (281b159) |
+| Section 7 | NEON box blur | Step 8 | **Done** (ba409a5) |
+| Section 7 | Apple Accelerate vImage | Step 9 | **Done** (eval: manual NEON preferred) |
 | Section 7 | Metal compute | — | Deferred (large effort, low ROI vs CPU) |
 | Section 7 | Gain maps / ISO 21496-1 | Step 16 | Deferred (standard not final) |
 | Section 8 | Exposure fusion | — | Not applicable (confirmed) |

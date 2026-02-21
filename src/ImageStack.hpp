@@ -44,11 +44,11 @@ public:
     }
 
     int addImage(Image && i);
-    void align();
+    void align(bool useFeatures = false);
     void crop();
     void computeResponseFunctions();
     void generateMask();
-    Array2D<float> compose(const RawParameters & md, int featherRadius) const;
+    Array2D<float> compose(const RawParameters & md, int featherRadius, float deghostSigma = 0.0f) const;
 
     size_t size() const { return images.size(); }
 

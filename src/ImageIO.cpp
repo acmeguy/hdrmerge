@@ -166,7 +166,7 @@ int ImageIO::load(const LoadOptions & options, ProgressIndicator & progress) {
         params.max = std::min(params.max, options.customWl);
     stack.calculateSaturationLevel(params, options.useCustomWl);
     if (options.align && params.canAlign()) {
-        stack.align();
+        stack.align(options.alignFeatures);
         if (options.crop) {
             stack.crop();
         }
@@ -187,7 +187,7 @@ void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
     params.width = stack.getWidth();
     params.height = stack.getHeight();
     params.adjustWhite(stack.getImage(stack.size() - 1));
-    Array2D<float> composedImage = stack.compose(params, options.featherRadius);
+    Array2D<float> composedImage = stack.compose(params, options.featherRadius, options.deghostSigma);
 
     progress.advance(33, "Rendering preview");
     QImage preview = renderPreview(composedImage, params, stack.getMaxExposure(), options.previewSize <= 1);
@@ -195,6 +195,7 @@ void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
     progress.advance(66, "Writing output");
     DngFloatWriter writer;
     writer.setBitsPerSample(options.bps);
+    writer.setCompressionLevel(options.compressionLevel);
     writer.setPreviewWidth((options.previewSize * stack.getWidth()) / 2);
     writer.setPreview(preview);
     writer.write(std::move(composedImage), params, options.fileName);

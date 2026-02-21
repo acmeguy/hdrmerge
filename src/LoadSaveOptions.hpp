@@ -37,8 +37,9 @@ struct LoadOptions {
     bool batch;
     double batchGap;
     bool withSingles;
+    bool alignFeatures;
     LoadOptions() : align(true), crop(true), useCustomWl(false), customWl(16383), batch(false), batchGap(2.0),
-        withSingles(false) {}
+        withSingles(false), alignFeatures(false) {}
 };
 
 
@@ -49,7 +50,9 @@ struct SaveOptions {
     bool saveMask;
     QString maskFileName;
     int featherRadius;
-    SaveOptions() : bps(32), previewSize(0), saveMask(false), featherRadius(3) {}
+    int compressionLevel;
+    float deghostSigma;
+    SaveOptions() : bps(32), previewSize(0), saveMask(false), featherRadius(3), compressionLevel(6), deghostSigma(0.0f) {}
 };
 
 } // namespace hdrmerge
