@@ -248,6 +248,46 @@ void RawParameters::fromLibRaw(LibRaw & rawData) {
     if (!camXyz[0][0]) {
         calculateCamXyz();
     }
+
+    // DNG dual-illuminant passthrough: read second illuminant color data from LibRaw
+    auto & dc0 = r.color.dng_color[0];
+    auto & dc1 = r.color.dng_color[1];
+    if (dc1.parsedfields && dc1.illuminant) {
+        hasDualIlluminant = true;
+        illuminant1 = dc0.illuminant;
+        illuminant2 = dc1.illuminant;
+        copy_n((float *)dc1.colormatrix, 4*3, (float *)colorMatrix2);
+        copy_n((float *)dc0.calibration, 4*4, (float *)calibration1);
+        copy_n((float *)dc1.calibration, 4*4, (float *)calibration2);
+
+        // ForwardMatrix from DNG file (more accurate than computed from camXyz)
+        bool hasF1 = false, hasF2 = false;
+        for (int i = 0; i < 3 && !hasF1; ++i)
+            for (int j = 0; j < 4 && !hasF1; ++j)
+                if (dc0.forwardmatrix[i][j] != 0.0f) hasF1 = true;
+        for (int i = 0; i < 3 && !hasF2; ++i)
+            for (int j = 0; j < 4 && !hasF2; ++j)
+                if (dc1.forwardmatrix[i][j] != 0.0f) hasF2 = true;
+        if (hasF1) {
+            hasForwardMatrix1Dng = true;
+            copy_n((float *)dc0.forwardmatrix, 3*4, (float *)forwardMatrix1Dng);
+        }
+        if (hasF2) {
+            copy_n((float *)dc1.forwardmatrix, 3*4, (float *)forwardMatrix2);
+        }
+        Log::debug("DNG dual-illuminant: illum1=", illuminant1, " illum2=", illuminant2,
+                   " fwd1=", hasF1, " fwd2=", hasF2);
+    }
+
+    // AsShotNeutral from DNG (exact white balance from original file)
+    auto & dl = r.color.dng_levels;
+    if (dl.asshotneutral[0] > 0.0f) {
+        hasAsShotNeutral = true;
+        copy_n(dl.asshotneutral, 4, asShotNeutral);
+        Log::debug("DNG AsShotNeutral: ", asShotNeutral[0], ' ', asShotNeutral[1],
+                   ' ', asShotNeutral[2], ' ', asShotNeutral[3]);
+    }
+
     dumpInfo();
 }
 

@@ -106,18 +106,24 @@ void ImageStack::calculateSaturationLevel(const RawParameters & params, bool use
     }
 
 
-    uint16_t maxPerColors = std::max(maxPerColor[0], std::max(maxPerColor[1],std::max(maxPerColor[2], maxPerColor[3])));
-    satThreshold = params.max == 0 ? maxPerColors : params.max;
-
-    if(maxPerColors > 0) {
-        satThreshold = std::min(satThreshold, maxPerColors);
+    // Per-channel saturation thresholds
+    for (int c = 0; c < 4; ++c) {
+        uint16_t chMax = maxPerColor[c];
+        uint16_t chThresh = params.max == 0 ? chMax : params.max;
+        if (chMax > 0) chThresh = std::min(chThresh, chMax);
+        if (!useCustomWl) chThresh *= 0.99;
+        satThresholdPerChannel[c] = chThresh;
     }
 
-    if (!useCustomWl) { // only scale when no custom white level was specified
-        satThreshold *= 0.99;
+    // Global threshold: most conservative (minimum across channels) for mask generation
+    satThreshold = satThresholdPerChannel[0];
+    for (int c = 1; c < 4; ++c) {
+        satThreshold = std::min(satThreshold, satThresholdPerChannel[c]);
     }
 
-    Log::debug( "Using white level ", satThreshold );
+    Log::debug("Using white levels: global=", satThreshold,
+               " R=", satThresholdPerChannel[0], " G1=", satThresholdPerChannel[1],
+               " G2=", satThresholdPerChannel[2], " B=", satThresholdPerChannel[3]);
 
     for (auto& i : images) {
         i.setSaturationThreshold(satThreshold);
@@ -199,12 +205,17 @@ void ImageStack::align(bool useFeatures) {
         for (auto & i : images) {
             i.releaseAlignData();
         }
-        // Measure sub-pixel alignment residuals (diagnostic only)
+        // Measure sub-pixel alignment residuals and store on each image
         for (size_t i = 0; i < images.size() - 1; ++i) {
-            double fracDx, fracDy;
-            measureSubPixelResidual(images[i + 1], images[i], width, height, fracDx, fracDy);
-            Log::debug("Image ", i, " sub-pixel residual: (", fracDx, ", ", fracDy, ") px");
+            double fdx, fdy;
+            measureSubPixelResidual(images[i + 1], images[i], width, height, fdx, fdy);
+            images[i].setFracDx(fdx);
+            images[i].setFracDy(fdy);
+            Log::debug("Image ", i, " sub-pixel residual: (", fdx, ", ", fdy, ") px");
         }
+        // Reference image (last in sorted order) has zero fractional offset
+        images.back().setFracDx(0.0);
+        images.back().setFracDy(0.0);
     }
 }
 
@@ -665,7 +676,103 @@ void ImageStack::correctHotPixels(const RawParameters & params, float sigma) {
 }
 
 
-ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, double clipPercentile) const {
+// Estimate noise model parameters for DNG NoiseProfile tag (51041).
+// For each channel c: variance = S[c] * signal + O[c], with signal normalized to [0,1].
+// S = shot noise coefficient (Poisson), O = read noise (estimated from masked pixels).
+// Both scaled by 1/numImages for the merged result.
+static void estimateNoiseProfile(const Image & brightest, const RawParameters & params,
+                                  int numImages, double noiseProfile[8]) {
+    double range = static_cast<double>(params.max);
+    if (range <= 0.0) return;
+
+    for (int c = 0; c < params.colors; ++c) {
+        // Shot noise coefficient: 1 / (max - cblack[c])
+        double channelRange = range - params.cblack[c];
+        if (channelRange <= 0.0) channelRange = range;
+        double S = 1.0 / channelRange;
+
+        // Read noise: estimate from masked/black pixel regions (top and left margins)
+        double sumSq = 0.0;
+        double sum = 0.0;
+        size_t count = 0;
+
+        // Top margin pixels
+        for (size_t y = 0; y < params.topMargin && y < brightest.getHeight(); ++y) {
+            for (size_t x = 0; x < brightest.getWidth(); ++x) {
+                if (params.FC(x, y) == c && brightest.contains(x, y)) {
+                    double v = static_cast<double>(brightest(x, y)) - params.cblack[c];
+                    sum += v;
+                    sumSq += v * v;
+                    ++count;
+                }
+            }
+        }
+        // Left margin pixels (below top margin to avoid double-counting)
+        for (size_t y = params.topMargin; y < brightest.getHeight(); ++y) {
+            for (size_t x = 0; x < params.leftMargin && x < brightest.getWidth(); ++x) {
+                if (params.FC(x, y) == c && brightest.contains(x, y)) {
+                    double v = static_cast<double>(brightest(x, y)) - params.cblack[c];
+                    sum += v;
+                    sumSq += v * v;
+                    ++count;
+                }
+            }
+        }
+
+        double O;
+        if (count >= 100) {
+            double mean = sum / count;
+            O = (sumSq / count - mean * mean) / (channelRange * channelRange);
+        } else {
+            O = 1e-6; // Conservative fallback
+        }
+
+        // Scale for merge: variance scales as 1/N
+        noiseProfile[c * 2]     = S / numImages;
+        noiseProfile[c * 2 + 1] = O / numImages;
+    }
+}
+
+
+// CFA-aware bilinear interpolation: read a pixel with fractional offset,
+// interpolating only from same-color neighbors on the CFA grid.
+// For Bayer, same-color neighbors are at distance 2; for X-Trans, distance 6.
+static inline uint16_t interpolateCFA(const Image & img, int x, int y,
+                                       double fdx, double fdy,
+                                       int step, size_t width, size_t height) {
+    // Skip if fractional offset is negligible
+    if (std::abs(fdx) < 0.1 && std::abs(fdy) < 0.1)
+        return img(x, y);
+
+    // Same-color neighbor positions (distance = step)
+    int x0 = x, y0 = y;
+    int x1 = (fdx >= 0) ? x + step : x - step;
+    int y1 = (fdy >= 0) ? y + step : y - step;
+
+    // Fractional weights (normalized to step distance)
+    double wx = std::abs(fdx) / step;
+    double wy = std::abs(fdy) / step;
+
+    // Bounds check: fall back to nearest if any neighbor is out of bounds
+    bool x1ok = x1 >= 0 && (size_t)x1 < width && img.contains(x1, y0);
+    bool y1ok = y1 >= 0 && (size_t)y1 < height && img.contains(x0, y1);
+    bool xyok = x1ok && y1ok && img.contains(x1, y1);
+
+    double v00 = img(x0, y0);
+    double v10 = x1ok ? (double)img(x1, y0) : v00;
+    double v01 = y1ok ? (double)img(x0, y1) : v00;
+    double v11 = xyok ? (double)img(x1, y1) : v00;
+
+    double result = v00 * (1.0 - wx) * (1.0 - wy)
+                  + v10 * wx * (1.0 - wy)
+                  + v01 * (1.0 - wx) * wy
+                  + v11 * wx * wy;
+
+    return static_cast<uint16_t>(std::max(0.0, std::min(65535.0, std::round(result))));
+}
+
+
+ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, double clipPercentile, bool subPixelAlign) const {
     int imageMax = images.size() - 1;
     BoxBlur map(fattenMask(mask, featherRadius));
     measureTime("Blur", [&] () {
@@ -685,10 +792,35 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         baseWeight[k] = 1.0 / images[k].getRelativeExposure();
     }
 
-    // Soft saturation rolloff: smoothly reduce weight as raw values approach saturation.
-    // This prevents hard edges at saturation boundaries.
-    const double satRolloff = 0.9 * satThreshold;
-    const double satRolloffRange = satThreshold - satRolloff;
+    // Per-channel saturation rolloff: each channel uses its own clipping threshold
+    double satRolloffPerCh[4], satRolloffRangePerCh[4], satThreshPerCh[4];
+    for (int c = 0; c < 4; ++c) {
+        satThreshPerCh[c] = satThresholdPerChannel[c];
+        satRolloffPerCh[c] = 0.9 * satThresholdPerChannel[c];
+        satRolloffRangePerCh[c] = satThreshPerCh[c] - satRolloffPerCh[c];
+    }
+
+    // Bayer-block rolloff consistency: use the most conservative (minimum) threshold
+    // across all channels for rolloff weight, preventing color fringe at exposure
+    // transitions after demosaicing. Per-channel thresholds still used for hard rejection.
+    bool useBlockRolloff = false;
+    double blockThresh = 0, blockRolloff = 0, blockRange = 0;
+    if (params.FC.getFilters() != 9) { // Bayer only, not X-Trans
+        blockThresh = *std::min_element(satThreshPerCh, satThreshPerCh + 4);
+        if (blockThresh < *std::max_element(satThreshPerCh, satThreshPerCh + 4)) {
+            useBlockRolloff = true;
+            blockRolloff = 0.9 * blockThresh;
+            blockRange = blockThresh - blockRolloff;
+            Log::debug("Bayer-block rolloff: min threshold=", blockThresh,
+                       " rolloff=", blockRolloff);
+        }
+    }
+
+    // CFA step for sub-pixel interpolation: distance to same-color neighbor
+    const int cfaStep = (params.FC.getFilters() == 9) ? 6 : 2;
+    if (subPixelAlign && numImages > 1) {
+        Log::debug("Sub-pixel alignment enabled (CFA step=", cfaStep, ")");
+    }
 
     const bool deghost = deghostSigma > 0.0f && numImages >= 3;
     if (deghost) {
@@ -704,22 +836,42 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
 
         for (size_t x = 0; x < width; ++x) {
             int numValid = 0;
+            int ch = params.FC(x, y);
 
             // Collect valid exposures with their radiances and weights
             for (int k = 0; k <= imageMax; k++) {
                 if (!images[k].contains(x, y)) continue;
-                uint16_t raw = images[k](x, y);
 
-                if (raw < 1) continue;
-                if (raw >= satThreshold) continue;
-
-                double w = baseWeight[k];
-                if (raw > satRolloff) {
-                    double t = (satThreshold - raw) / satRolloffRange;
-                    w *= t * t; // Quadratic rolloff
+                uint16_t raw;
+                if (subPixelAlign && (images[k].getFracDx() != 0.0 || images[k].getFracDy() != 0.0)) {
+                    raw = interpolateCFA(images[k], x, y,
+                                         images[k].getFracDx(), images[k].getFracDy(),
+                                         cfaStep, width, height);
+                } else {
+                    raw = images[k](x, y);
                 }
 
-                double radiance = images[k].exposureAt(x, y);
+                if (raw < 1) continue;
+                if (raw >= satThreshPerCh[ch]) continue;
+
+                double w = baseWeight[k];
+                if (useBlockRolloff) {
+                    if (raw >= blockThresh) {
+                        w = 0.0;
+                    } else if (raw > blockRolloff) {
+                        double t = (blockThresh - raw) / blockRange;
+                        w *= t * t;
+                    }
+                } else {
+                    if (raw > satRolloffPerCh[ch]) {
+                        double t = (satThreshPerCh[ch] - raw) / satRolloffRangePerCh[ch];
+                        w *= t * t;
+                    }
+                }
+
+                double radiance = (subPixelAlign && (images[k].getFracDx() != 0.0 || images[k].getFracDy() != 0.0))
+                    ? images[k].exposureForRaw(raw)
+                    : images[k].exposureAt(x, y);
                 if (radiance <= 0.0) continue;
 
                 radiances[numValid] = radiance;
@@ -741,13 +893,14 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                 std::nth_element(absDevs.begin(), absDevs.begin() + numValid / 2, absDevs.begin() + numValid);
                 double mad = absDevs[numValid / 2] * 1.4826; // MAD to sigma
 
-                // Reject outliers (set weight to 0)
+                // Soft Gaussian deghosting: smoothly downweight outliers instead of
+                // hard rejection, producing smoother ghost boundaries (Khan et al. 2006)
                 if (mad > 0.0) {
                     double threshold = deghostSigma * mad;
+                    double invThreshSq = 1.0 / (threshold * threshold);
                     for (int i = 0; i < numValid; i++) {
-                        if (std::abs(radiances[i] - median) > threshold) {
-                            weights[i] = 0.0;
-                        }
+                        double dev = std::abs(radiances[i] - median);
+                        weights[i] *= std::exp(-0.5 * dev * dev * invThreshSq);
                     }
                 }
             }
@@ -828,27 +981,76 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         }
     }
 
-    // Compute BaselineExposure from geometric mean of active-area pixels
+    // Compute BaselineExposure from median of log-luminance (robust to HDR skew)
     double baselineExposureEV = 0.0;
     {
-        double logSum = 0.0;
-        size_t logCount = 0;
-        #pragma omp parallel for reduction(+:logSum,logCount)
+        // Pass 1: find log-luminance range and pixel count
+        double logMin = 1e30, logMax = -1e30;
+        size_t totalPixels = 0;
+        #pragma omp parallel for reduction(min:logMin) reduction(max:logMax) reduction(+:totalPixels)
         for (size_t y = params.topMargin; y < params.topMargin + params.height; ++y) {
             for (size_t x = params.leftMargin; x < params.leftMargin + params.width; ++x) {
                 float v = dst(x, y) - params.blackAt(x - params.leftMargin, y - params.topMargin);
                 if (v > 0.0f) {
-                    logSum += std::log(static_cast<double>(v));
-                    logCount++;
+                    double lv = std::log(static_cast<double>(v));
+                    if (lv < logMin) logMin = lv;
+                    if (lv > logMax) logMax = lv;
+                    totalPixels++;
                 }
             }
         }
-        if (logCount > 0) {
-            double geometricMean = std::exp(logSum / logCount);
+
+        if (totalPixels > 0 && logMax > logMin) {
+            // Pass 2: histogram-based median via per-thread local histograms
+            const int numBins = 10000;
+            double binScale = (numBins - 1) / (logMax - logMin);
+            std::vector<size_t> histogram(numBins, 0);
+
+            #pragma omp parallel
+            {
+                std::vector<size_t> localHist(numBins, 0);
+                #pragma omp for nowait
+                for (size_t y = params.topMargin; y < params.topMargin + params.height; ++y) {
+                    for (size_t x = params.leftMargin; x < params.leftMargin + params.width; ++x) {
+                        float v = dst(x, y) - params.blackAt(x - params.leftMargin, y - params.topMargin);
+                        if (v > 0.0f) {
+                            double lv = std::log(static_cast<double>(v));
+                            int bin = static_cast<int>((lv - logMin) * binScale);
+                            if (bin < 0) bin = 0;
+                            if (bin >= numBins) bin = numBins - 1;
+                            localHist[bin]++;
+                        }
+                    }
+                }
+                #pragma omp critical
+                {
+                    for (int i = 0; i < numBins; i++)
+                        histogram[i] += localHist[i];
+                }
+            }
+
+            // Find 50th-percentile bin with linear interpolation
+            size_t target = totalPixels / 2;
+            size_t cumulative = 0;
+            int medianBin = 0;
+            for (int i = 0; i < numBins; i++) {
+                cumulative += histogram[i];
+                if (cumulative >= target) {
+                    medianBin = i;
+                    break;
+                }
+            }
+            // Sub-bin interpolation: fraction within the median bin
+            size_t prevCumulative = cumulative - histogram[medianBin];
+            double frac = (histogram[medianBin] > 0)
+                ? static_cast<double>(target - prevCumulative) / histogram[medianBin]
+                : 0.5;
+            double medianLog = logMin + (medianBin + frac) / binScale;
+            double medianValue = std::exp(medianLog);
+
             double range = static_cast<double>(params.max - params.maxBlack);
-            if (geometricMean > 0.0 && range > 0.0) {
-                baselineExposureEV = std::log2(0.18 * range / geometricMean);
-                // Clamp to [-5.0, +5.0]
+            if (medianValue > 0.0 && range > 0.0) {
+                baselineExposureEV = std::log2(0.18 * range / medianValue);
                 if (baselineExposureEV < -5.0) baselineExposureEV = -5.0;
                 if (baselineExposureEV > 5.0) baselineExposureEV = 5.0;
             }
@@ -858,5 +1060,15 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                " normVal=", normVal, " maxVal=", maxVal,
                " BaselineExposure=", baselineExposureEV, " EV");
 
-    return { std::move(dst), baselineExposureEV, numImages };
+    ComposeResult result;
+    result.image = std::move(dst);
+    result.baselineExposureEV = baselineExposureEV;
+    result.numImages = numImages;
+
+    // Estimate noise profile from brightest exposure's masked regions
+    estimateNoiseProfile(images.front(), params, numImages, result.noiseProfile);
+    Log::debug("NoiseProfile: S0=", result.noiseProfile[0], " O0=", result.noiseProfile[1],
+               " S1=", result.noiseProfile[2], " O1=", result.noiseProfile[3]);
+
+    return result;
 }

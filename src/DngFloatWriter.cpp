@@ -119,6 +119,14 @@ enum {
 
     BASELINEEXPOSURE = 50730,
     BASELINENOISE = 50731,
+    DEFAULTBLACKRENDER = 51110,
+    FORWARDMATRIX1 = 50964,
+    FORWARDMATRIX2 = 50965,
+    COLORMATRIX2 = 50722,
+    CALIBRATIONILLUMINANT2 = 50779,
+    CAMERACALIBRATION1 = 50706,
+    CAMERACALIBRATION2 = 50707,
+    NOISEPROFILE = 51041,
 
     YCBCRCOEFFS = 529,
     YCBCRSUBSAMPLING = 530,
@@ -255,7 +263,8 @@ void DngFloatWriter::createMainIFD() {
     mainIFD.addEntry(DATETIMEORIGINAL, params->dateTime);
 
     // Profile
-    mainIFD.addEntry(CALIBRATIONILLUMINANT, IFD::SHORT, TIFF_D65);
+    uint16_t illum1 = params->hasDualIlluminant ? params->illuminant1 : TIFF_D65;
+    mainIFD.addEntry(CALIBRATIONILLUMINANT, IFD::SHORT, illum1);
     string profName(params->maker + " " + params->model);
     mainIFD.addEntry(PROFILENAME, profName);
     int32_t colorMatrix[24];
@@ -267,15 +276,140 @@ void DngFloatWriter::createMainIFD() {
     }
     mainIFD.addEntry(COLORMATRIX, IFD::SRATIONAL, params->colors * 3, colorMatrix);
 
+    // ForwardMatrix1: maps white-balanced camera colors to XYZ (D50)
+    if (params->hasForwardMatrix1Dng && params->colors == 3) {
+        // Use ForwardMatrix1 from DNG file (more accurate than computed)
+        int32_t forwardMatrix[18];
+        for (int row = 0, i = 0; row < 3; ++row) {
+            for (int col = 0; col < params->colors; ++col) {
+                forwardMatrix[i++] = static_cast<int32_t>(std::round(
+                    params->forwardMatrix1Dng[row][col] * 10000.0));
+                forwardMatrix[i++] = 10000;
+            }
+        }
+        mainIFD.addEntry(FORWARDMATRIX1, IFD::SRATIONAL, 3 * params->colors, forwardMatrix);
+    } else if (params->colors == 3) {
+        // Compute as inverse of camXyz, with rows normalized to sum to D50 white point
+        const auto & m = params->camXyz;
+        double det = m[0][0] * (m[1][1]*m[2][2] - m[1][2]*m[2][1])
+                   - m[0][1] * (m[1][0]*m[2][2] - m[1][2]*m[2][0])
+                   + m[0][2] * (m[1][0]*m[2][1] - m[1][1]*m[2][0]);
+        if (std::abs(det) > 1e-10) {
+            double inv[3][3];
+            inv[0][0] = (m[1][1]*m[2][2] - m[1][2]*m[2][1]) / det;
+            inv[0][1] = (m[0][2]*m[2][1] - m[0][1]*m[2][2]) / det;
+            inv[0][2] = (m[0][1]*m[1][2] - m[0][2]*m[1][1]) / det;
+            inv[1][0] = (m[1][2]*m[2][0] - m[1][0]*m[2][2]) / det;
+            inv[1][1] = (m[0][0]*m[2][2] - m[0][2]*m[2][0]) / det;
+            inv[1][2] = (m[0][2]*m[1][0] - m[0][0]*m[1][2]) / det;
+            inv[2][0] = (m[1][0]*m[2][1] - m[1][1]*m[2][0]) / det;
+            inv[2][1] = (m[0][1]*m[2][0] - m[0][0]*m[2][1]) / det;
+            inv[2][2] = (m[0][0]*m[1][1] - m[0][1]*m[1][0]) / det;
+
+            static const double d50[3] = { 0.9642, 1.0, 0.8249 };
+            double fwd[3][3];
+            for (int row = 0; row < 3; ++row) {
+                double rowSum = inv[row][0] + inv[row][1] + inv[row][2];
+                if (std::abs(rowSum) > 1e-10) {
+                    for (int col = 0; col < 3; ++col)
+                        fwd[row][col] = inv[row][col] * d50[row] / rowSum;
+                } else {
+                    for (int col = 0; col < 3; ++col)
+                        fwd[row][col] = 0.0;
+                }
+            }
+
+            int32_t forwardMatrix[18];
+            for (int row = 0, i = 0; row < 3; ++row) {
+                for (int col = 0; col < 3; ++col) {
+                    forwardMatrix[i++] = static_cast<int32_t>(std::round(fwd[row][col] * 10000.0));
+                    forwardMatrix[i++] = 10000;
+                }
+            }
+            mainIFD.addEntry(FORWARDMATRIX1, IFD::SRATIONAL, 9, forwardMatrix);
+        }
+    }
+
+    // Dual-illuminant passthrough for DNG inputs
+    if (params->hasDualIlluminant) {
+        mainIFD.addEntry(CALIBRATIONILLUMINANT2, IFD::SHORT, params->illuminant2);
+
+        // ColorMatrix2
+        int32_t cm2[24];
+        for (int row = 0, i = 0; row < params->colors; ++row) {
+            for (int col = 0; col < 3; ++col) {
+                cm2[i++] = std::round(params->colorMatrix2[row][col] * 10000.0f);
+                cm2[i++] = 10000;
+            }
+        }
+        mainIFD.addEntry(COLORMATRIX2, IFD::SRATIONAL, params->colors * 3, cm2);
+
+        // ForwardMatrix2
+        bool hasF2 = false;
+        for (int i = 0; i < 3 && !hasF2; ++i)
+            for (int j = 0; j < params->colors && !hasF2; ++j)
+                if (params->forwardMatrix2[i][j] != 0.0f) hasF2 = true;
+        if (hasF2) {
+            int32_t fm2[24];
+            for (int row = 0, i = 0; row < 3; ++row) {
+                for (int col = 0; col < params->colors; ++col) {
+                    fm2[i++] = static_cast<int32_t>(std::round(
+                        params->forwardMatrix2[row][col] * 10000.0));
+                    fm2[i++] = 10000;
+                }
+            }
+            mainIFD.addEntry(FORWARDMATRIX2, IFD::SRATIONAL, 3 * params->colors, fm2);
+        }
+
+        // CameraCalibration1/2
+        bool hasCal1 = false, hasCal2 = false;
+        for (int i = 0; i < params->colors && !hasCal1; ++i)
+            for (int j = 0; j < params->colors && !hasCal1; ++j)
+                if (params->calibration1[i][j] != (i == j ? 1.0f : 0.0f)) hasCal1 = true;
+        for (int i = 0; i < params->colors && !hasCal2; ++i)
+            for (int j = 0; j < params->colors && !hasCal2; ++j)
+                if (params->calibration2[i][j] != (i == j ? 1.0f : 0.0f)) hasCal2 = true;
+        if (hasCal1) {
+            int32_t cal1[32];
+            for (int row = 0, i = 0; row < params->colors; ++row) {
+                for (int col = 0; col < params->colors; ++col) {
+                    cal1[i++] = static_cast<int32_t>(std::round(
+                        params->calibration1[row][col] * 10000.0));
+                    cal1[i++] = 10000;
+                }
+            }
+            mainIFD.addEntry(CAMERACALIBRATION1, IFD::SRATIONAL,
+                             params->colors * params->colors, cal1);
+        }
+        if (hasCal2) {
+            int32_t cal2[32];
+            for (int row = 0, i = 0; row < params->colors; ++row) {
+                for (int col = 0; col < params->colors; ++col) {
+                    cal2[i++] = static_cast<int32_t>(std::round(
+                        params->calibration2[row][col] * 10000.0));
+                    cal2[i++] = 10000;
+                }
+            }
+            mainIFD.addEntry(CAMERACALIBRATION2, IFD::SRATIONAL,
+                             params->colors * params->colors, cal2);
+        }
+    }
+
     // Color
     uint32_t analogBalance[] = { 1, 1, 1, 1, 1, 1, 1, 1 };
     mainIFD.addEntry(ANALOGBALANCE, IFD::RATIONAL, params->colors, analogBalance);
-    double wb[] = { 1.0/params->camMul[0], 1.0/params->camMul[1], 1.0/params->camMul[2], 1.0/params->camMul[3] };
-    uint32_t cameraNeutral[] = {
-        (uint32_t)std::round(1000000.0 * wb[0]), 1000000,
-        (uint32_t)std::round(1000000.0 * wb[1]), 1000000,
-        (uint32_t)std::round(1000000.0 * wb[2]), 1000000,
-        (uint32_t)std::round(1000000.0 * wb[3]), 1000000};
+    uint32_t cameraNeutral[8];
+    if (params->hasAsShotNeutral) {
+        for (int c = 0; c < params->colors; ++c) {
+            cameraNeutral[c*2]   = static_cast<uint32_t>(std::round(1000000.0 * params->asShotNeutral[c]));
+            cameraNeutral[c*2+1] = 1000000;
+        }
+    } else {
+        for (int c = 0; c < params->colors; ++c) {
+            cameraNeutral[c*2]   = static_cast<uint32_t>(std::round(1000000.0 / params->camMul[c]));
+            cameraNeutral[c*2+1] = 1000000;
+        }
+    }
     mainIFD.addEntry(CAMERANEUTRAL, IFD::RATIONAL, params->colors, cameraNeutral);
     mainIFD.addEntry(ORIENTATION, IFD::SHORT, params->tiffOrientation);
     mainIFD.addEntry(UNIQUENAME, params->maker + " " + params->model);
@@ -290,6 +424,9 @@ void DngFloatWriter::createMainIFD() {
         mainIFD.addEntry(BASELINEEXPOSURE, IFD::SRATIONAL, 1, bleData);
     }
 
+    // DefaultBlackRender = None — tell ACR to skip automatic black-point subtraction
+    mainIFD.addEntry(DEFAULTBLACKRENDER, IFD::LONG, (uint32_t)1);
+
     // BaselineNoise (RATIONAL) — relative noise (1/sqrt(N) for N merged exposures)
     if (baselineNoiseRatio < 1.0) {
         uint32_t bnData[2] = {
@@ -297,6 +434,11 @@ void DngFloatWriter::createMainIFD() {
             1000000
         };
         mainIFD.addEntry(BASELINENOISE, IFD::RATIONAL, 1, bnData);
+    }
+
+    // NoiseProfile (DOUBLE) — per-channel noise model: variance = S*signal + O
+    if (noiseProfileColors > 0 && noiseProfileData[0] > 0.0) {
+        mainIFD.addEntry(NOISEPROFILE, IFD::DOUBLE, noiseProfileColors * 2, noiseProfileData);
     }
 
     mainIFD.addEntry(SUBIFDS, IFD::LONG, previewWidth > 0 ? 2 : 1, subIFDoffsets);
