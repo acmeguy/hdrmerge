@@ -125,6 +125,48 @@ void ImageStack::calculateSaturationLevel(const RawParameters & params, bool use
 }
 
 
+// Compute sub-pixel alignment residual between two integer-aligned images.
+// Uses SSD (sum of squared differences) at 5 offsets with parabolic fitting.
+// Only for diagnostic logging — compositing uses integer shifts.
+static void measureSubPixelResidual(const Image & ref, const Image & img,
+                                     size_t width, size_t height,
+                                     double & fracDx, double & fracDy) {
+    // Compute mean SSD at a given additional offset (ox, oy) relative to current alignment.
+    // Subsample every 4th pixel for speed.
+    auto computeSSD = [&](int ox, int oy) -> double {
+        double ssd = 0;
+        size_t count = 0;
+        int margin = 2;
+        for (size_t y = margin; y < height - margin; y += 4) {
+            for (size_t x = margin; x < width - margin; x += 4) {
+                int rx = (int)x, ry = (int)y;
+                int ix = rx + ox, iy = ry + oy;
+                if (ref.contains(rx, ry) && img.contains(ix, iy)) {
+                    double d = (double)ref(rx, ry) - (double)img(ix, iy);
+                    ssd += d * d;
+                    ++count;
+                }
+            }
+        }
+        return count > 0 ? ssd / count : 1e18;
+    };
+
+    double c = computeSSD(0, 0);
+    double l = computeSSD(-1, 0);
+    double r = computeSSD(1, 0);
+    double u = computeSSD(0, -1);
+    double d = computeSSD(0, 1);
+
+    // Parabolic interpolation: vertex of y = ax^2 + bx + c at x = -b/(2a)
+    double denom_x = l + r - 2.0 * c;
+    double denom_y = u + d - 2.0 * c;
+    fracDx = (denom_x != 0.0) ? (l - r) / (2.0 * denom_x) : 0.0;
+    fracDy = (denom_y != 0.0) ? (u - d) / (2.0 * denom_y) : 0.0;
+    // Clamp to [-0.5, 0.5] — larger values indicate the parabola fit is unreliable
+    fracDx = std::max(-0.5, std::min(0.5, fracDx));
+    fracDy = std::max(-0.5, std::min(0.5, fracDy));
+}
+
 void ImageStack::align() {
     if (images.size() > 1) {
         Timer t("Align");
@@ -144,6 +186,12 @@ void ImageStack::align() {
         }
         for (auto & i : images) {
             i.releaseAlignData();
+        }
+        // Measure sub-pixel alignment residuals (diagnostic only)
+        for (size_t i = 0; i < images.size() - 1; ++i) {
+            double fracDx, fracDy;
+            measureSubPixelResidual(images[i + 1], images[i], width, height, fracDx, fracDy);
+            Log::debug("Image ", i, " sub-pixel residual: (", fracDx, ", ", fracDy, ") px");
         }
     }
 }
