@@ -796,10 +796,10 @@ Fill in after each step. Steps 0-9 should produce bit-identical output. Steps 10
 
 | Step | Description | Set A time | Set B time | Set C time | Identical to prev | Speedup vs prev |
 |------|-------------|-----------|-----------|-----------|-------------------|----------------|
-| 6 | NEON fattenMask | | | | | |
-| 7 | NEON float2half | | | | | |
-| 8 | NEON box blur | | | | | |
-| 9 | vImage eval | | | | see notes | |
+| 6 | NEON fattenMask | 5.30s | 6.01s | 6.04s | pixel-identical | ~1.05x vs step 5 |
+| 7 | NEON float2half | 5.84s | 7.23s | 6.50s | pixel-identical (32-bit); 16-bit uses vcvt_f16_f32 | N/A (no-op at -b 32) |
+| 8 | NEON box blur | 5.46s | 6.25s | 6.12s | pixel-identical | ~1.0x (compiler likely auto-vectorized before) |
+| 9 | vImage eval | — | — | — | N/A | vImage f16 1.28x faster per tile but only ~0.6ms total; dilate/blur not drop-in replacements |
 
 ### Steps 10-11: Alignment
 
@@ -870,10 +870,10 @@ Every actionable finding from `research-modern-hdr-techniques.md` is mapped belo
 | Section 4 | Configurable compression level | Step 5 | **Done** (9cd3485) |
 | Section 5 | DNG 1.7 / JPEG XL | Step 15 | Deferred (ecosystem) |
 | Section 6 | LibRaw upgrade | Step 2 | **Done** (0.21.4 verified) |
-| Section 7 | NEON fattenMask | Step 6 | Planned |
-| Section 7 | NEON float-to-half | Step 7 | Planned |
-| Section 7 | NEON box blur | Step 8 | Planned |
-| Section 7 | Apple Accelerate vImage | Step 9 | Planned (eval) |
+| Section 7 | NEON fattenMask | Step 6 | **Done** (04d71ee) |
+| Section 7 | NEON float-to-half | Step 7 | **Done** (281b159) |
+| Section 7 | NEON box blur | Step 8 | **Done** (ba409a5) |
+| Section 7 | Apple Accelerate vImage | Step 9 | **Done** (eval: manual NEON preferred) |
 | Section 7 | Metal compute | — | Deferred (large effort, low ROI vs CPU) |
 | Section 7 | Gain maps / ISO 21496-1 | Step 16 | Deferred (standard not final) |
 | Section 8 | Exposure fusion | — | Not applicable (confirmed) |
