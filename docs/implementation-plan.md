@@ -810,10 +810,10 @@ Fill in after each step. Steps 0-9 should produce bit-identical output. Steps 10
 
 ### Steps 12-13: Algorithm
 
-| Step | Description | Set A time | Set A size | Visual quality | Opens in LR |
-|------|-------------|-----------|-----------|---------------|------------|
-| 12 | Noise-optimal merge | | | | |
-| 13 | Ghost detection | | | | |
+| Step | Description | Set A time | Set A size | Set B time | Set B size | Set C time | Set C size | Visual quality | Opens in LR |
+|------|-------------|-----------|-----------|-----------|-----------|-----------|-----------|---------------|------------|
+| 12 | Noise-optimal merge | 5.59s | 115,242,018 | 6.41s | 105,310,804 | 6.24s | 126,385,818 | TBD (verify in LR) | TBD |
+| 13 | Ghost detection | | | | | | | | |
 
 ### Step 14: I/O
 
@@ -860,7 +860,7 @@ Every actionable finding from `research-modern-hdr-techniques.md` is mapped belo
 
 | Research Section | Finding | Plan Step | Status |
 |-----------------|---------|-----------|--------|
-| Section 1 | Noise-optimal merge (Poisson) | Step 12 | Planned |
+| Section 1 | Noise-optimal merge (Poisson) | Step 12 | **Done** |
 | Section 2 | Sigma-clipping ghost detection | Step 13 | Planned |
 | Section 3 | Sub-pixel phase correlation | Step 10 | Planned |
 | Section 3 | Feature-based alignment (ORB/AKAZE) | Step 11 | Planned |

@@ -556,43 +556,65 @@ Array2D<float> ImageStack::compose(const RawParameters & params, int featherRadi
     dst.displace(-(int)params.leftMargin, -(int)params.topMargin);
     dst.fillBorders(0.f);
 
+    // Poisson-optimal merge: weight each exposure by 1/relativeExposure (∝ exposure time).
+    // This is the MLE weight for Poisson noise — longer exposures captured more photons
+    // and thus have lower relative noise, so they get higher weight.
+    std::vector<double> baseWeight(images.size());
+    for (size_t k = 0; k < images.size(); k++) {
+        baseWeight[k] = 1.0 / images[k].getRelativeExposure();
+    }
+
+    // Soft saturation rolloff: smoothly reduce weight as raw values approach saturation.
+    // This prevents hard edges at saturation boundaries.
+    const double satRolloff = 0.9 * satThreshold;
+    const double satRolloffRange = satThreshold - satRolloff;
+
     float maxVal = 0.0;
-    double saturatedRange = params.max - satThreshold;
     #pragma omp parallel for schedule(dynamic,16) reduction(max:maxVal)
     for (size_t y = 0; y < height; ++y) {
         for (size_t x = 0; x < width; ++x) {
-            double v, vv;
-            double p = map(x,y);
-            p = p < 0.0 ? 0.0 : p;
-            int j = p;
-            if (images[j].contains(x, y)) {
-                p = p - j;
-                v = images[j].exposureAt(x, y);
-                // Adjust false highlights
-                if (j < origMask(x,y)) { // SaturatedAround
-                    v /= params.whiteMultAt(x, y);
-                    if(p > 0.0001) {
-                        uint16_t rawV = images[j].getMaxAround(x, y);
-                        double k = (rawV - satThreshold) / saturatedRange;
-                        if (k > 1.0)
-                            k = 1.0;
-                        p += (1.0 - p) * k;
+            double weightedSum = 0.0;
+            double totalWeight = 0.0;
+
+            for (int k = 0; k <= imageMax; k++) {
+                if (!images[k].contains(x, y)) continue;
+                uint16_t raw = images[k](x, y);
+
+                if (raw < 1) continue;
+                if (raw >= satThreshold) continue;
+
+                double w = baseWeight[k];
+                if (raw > satRolloff) {
+                    double t = (satThreshold - raw) / satRolloffRange;
+                    w *= t * t; // Quadratic rolloff
+                }
+
+                double radiance = images[k].exposureAt(x, y);
+                if (radiance <= 0.0) continue;
+
+                weightedSum += w * radiance;
+                totalWeight += w;
+            }
+
+            double v;
+            if (totalWeight > 0.0) {
+                v = weightedSum / totalWeight;
+            } else {
+                // All exposures saturated or unavailable — fall back to mask-based selection
+                double p = map(x,y);
+                p = p < 0.0 ? 0.0 : p;
+                int j = (int)p;
+                if (j > imageMax) j = imageMax;
+                if (images[j].contains(x, y)) {
+                    v = images[j].exposureAt(x, y);
+                    if (j < (int)origMask(x,y)) {
+                        v /= params.whiteMultAt(x, y);
                     }
+                } else {
+                    v = 0.0;
                 }
-            } else {
-                v = 0.0;
-                p = 1.0;
             }
-            if (p > 0.0001 && j < imageMax && images[j + 1].contains(x, y)) {
-                vv = images[j + 1].exposureAt(x, y);
-                if (j + 1 < origMask(x,y)) { // SaturatedAround
-                    vv /= params.whiteMultAt(x, y);
-                }
-            } else {
-                vv = 0.0;
-                p = 0.0;
-            }
-            v -= p * (v - vv);
+
             dst(x, y) = v;
             if (v > maxVal) {
                 maxVal = v;
