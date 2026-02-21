@@ -21,14 +21,25 @@
  */
 
 #include <iostream>
+#include <climits>
 #include <cmath>
+#include <cstdio>
+#include <memory>
 #include <vector>
 #include <QBuffer>
+#include <QFile>
 #include <QDateTime>
 #include <QImageWriter>
 #include <zlib.h>
 #ifdef HAVE_LIBDEFLATE
 #include <libdeflate.h>
+#endif
+#ifdef HAVE_LIBJXL
+#include <jxl/encode.h>
+#include <jxl/encode_cxx.h>
+#include <jxl/codestream_header.h>
+#include <jxl/color_encoding.h>
+#include <jxl/types.h>
 #endif
 #ifdef _OPENMP
 #include <omp.h>
@@ -43,7 +54,6 @@
 #include "DngFloatWriter.hpp"
 #include "RawParameters.hpp"
 #include "Log.hpp"
-#include "ExifTransfer.hpp"
 using namespace std;
 
 
@@ -107,6 +117,17 @@ enum {
     YRESOLUTION = 283,
     COPYRIGHT = 33432,
 
+    BASELINEEXPOSURE = 50730,
+    BASELINENOISE = 50731,
+    DEFAULTBLACKRENDER = 51110,
+    FORWARDMATRIX1 = 50964,
+    FORWARDMATRIX2 = 50965,
+    COLORMATRIX2 = 50722,
+    CALIBRATIONILLUMINANT2 = 50779,
+    CAMERACALIBRATION1 = 50706,
+    CAMERACALIBRATION2 = 50707,
+    NOISEPROFILE = 51041,
+
     YCBCRCOEFFS = 529,
     YCBCRSUBSAMPLING = 530,
     YCBCRPOSITIONING = 531,
@@ -125,6 +146,7 @@ enum {
     TIFF_FPFORMAT = 3,
     TIFF_CFA = 32803,
     TIFF_YCBCR = 6,
+    TIFF_JXL = 52546,
 };
 
 
@@ -133,6 +155,9 @@ void DngFloatWriter::write(Array2D<float> && rawPixels, const RawParameters & p,
     rawData = std::move(rawPixels);
     width = rawData.getWidth();
     height = rawData.getHeight();
+#ifdef HAVE_LIBJXL
+    useJXL = (bps == 16);
+#endif
 
     renderPreviews();
 
@@ -146,28 +171,79 @@ void DngFloatWriter::write(Array2D<float> && rawPixels, const RawParameters & p,
         dataOffset += previewIFD.length();
     }
     mainIFD.setValue(SUBIFDS, (const void *)subIFDoffsets);
-    pos = dataOffset;
-    size_t dataSize = dataOffset + thumbSize() + previewSize() + rawSize();
-    fileData.reset(new uint8_t[dataSize]);
 
-    Timer t("Write output");
-    writePreviews();
-    writeRawData();
-    dataSize = pos;
-    pos = 0;
-    TiffHeader().write(fileData.get(), pos);
-    mainIFD.write(fileData.get(), pos, false);
-    rawIFD.write(fileData.get(), pos, false);
-    if (previewWidth > 0) {
-        previewIFD.write(fileData.get(), pos, false);
+    // Open temp file for streaming (RAII ensures fclose on any exit path)
+    QString tempPath = dstFileName + ".tmp";
+    std::unique_ptr<FILE, int(*)(FILE*)> fOwner(
+        fopen(tempPath.toLocal8Bit().constData(), "w+b"), fclose);
+    FILE * f = fOwner.get();
+    if (!f) {
+        fOwner.release(); // prevent fclose(NULL) — undefined behavior
+        std::cerr << "Failed to open temp file: " << tempPath.toLocal8Bit().constData() << std::endl;
+        return;
     }
 
-    Exif::transfer(p.fileName, dstFileName, fileData.get(), dataSize);
+    {
+        Timer t("Write output");
+
+        // Write placeholder for headers + IFDs (will be patched later)
+        std::vector<uint8_t> zeros(dataOffset, 0);
+        if (fwrite(zeros.data(), 1, dataOffset, f) != dataOffset) {
+            std::cerr << "DNG: failed writing header placeholder" << std::endl;
+            fOwner.reset();
+            QFile::remove(tempPath);
+            return;
+        }
+
+        // Write previews directly to file
+        if (!writePreviewsToFile(f, dataOffset)) {
+            fOwner.reset();
+            QFile::remove(tempPath);
+            return;
+        }
+
+        // Write compressed tiles directly to file
+        if (!writeRawDataToFile(f)) {
+            fOwner.reset();
+            QFile::remove(tempPath);
+            return;
+        }
+    }
+
+    // Release input pixel data (no longer needed)
+    rawData = Array2D<float>();
+
+    // Build final IFD buffer and patch file header
+    std::vector<uint8_t> headerBuf(dataOffset);
+    size_t headerPos = 0;
+    TiffHeader().write(headerBuf.data(), headerPos);
+    mainIFD.write(headerBuf.data(), headerPos, false);
+    rawIFD.write(headerBuf.data(), headerPos, false);
+    if (previewWidth > 0) {
+        previewIFD.write(headerBuf.data(), headerPos, false);
+    }
+
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        std::cerr << "DNG: fseek failed patching header" << std::endl;
+        fOwner.reset();
+        QFile::remove(tempPath);
+        return;
+    }
+    if (fwrite(headerBuf.data(), 1, dataOffset, f) != dataOffset) {
+        std::cerr << "DNG: failed patching file header" << std::endl;
+        fOwner.reset();
+        QFile::remove(tempPath);
+        return;
+    }
+    fOwner.reset();
+
+    // Transfer EXIF metadata from source NEF, write final DNG
+    Exif::transferFile(p.fileName, tempPath, dstFileName, acrProfilePath, adaptiveCurves);
 }
 
 
 void DngFloatWriter::createMainIFD() {
-    uint8_t dngVersion[] = { 1, 4, 0, 0 };
+    uint8_t dngVersion[] = { 1, useJXL ? (uint8_t)7 : (uint8_t)4, 0, 0 };
     mainIFD.addEntry(DNGVERSION, IFD::BYTE, 4, dngVersion);
     mainIFD.addEntry(DNGBACKVERSION, IFD::BYTE, 4, dngVersion);
     uint8_t tiffep[] = { 1, 0, 0, 0 };
@@ -187,7 +263,8 @@ void DngFloatWriter::createMainIFD() {
     mainIFD.addEntry(DATETIMEORIGINAL, params->dateTime);
 
     // Profile
-    mainIFD.addEntry(CALIBRATIONILLUMINANT, IFD::SHORT, TIFF_D65);
+    uint16_t illum1 = params->hasDualIlluminant ? params->illuminant1 : TIFF_D65;
+    mainIFD.addEntry(CALIBRATIONILLUMINANT, IFD::SHORT, illum1);
     string profName(params->maker + " " + params->model);
     mainIFD.addEntry(PROFILENAME, profName);
     int32_t colorMatrix[24];
@@ -199,19 +276,171 @@ void DngFloatWriter::createMainIFD() {
     }
     mainIFD.addEntry(COLORMATRIX, IFD::SRATIONAL, params->colors * 3, colorMatrix);
 
+    // ForwardMatrix1: maps white-balanced camera colors to XYZ (D50)
+    if (params->hasForwardMatrix1Dng && params->colors == 3) {
+        // Use ForwardMatrix1 from DNG file (more accurate than computed)
+        int32_t forwardMatrix[18];
+        for (int row = 0, i = 0; row < 3; ++row) {
+            for (int col = 0; col < params->colors; ++col) {
+                forwardMatrix[i++] = static_cast<int32_t>(std::round(
+                    params->forwardMatrix1Dng[row][col] * 10000.0));
+                forwardMatrix[i++] = 10000;
+            }
+        }
+        mainIFD.addEntry(FORWARDMATRIX1, IFD::SRATIONAL, 3 * params->colors, forwardMatrix);
+    } else if (params->colors == 3) {
+        // Compute as inverse of camXyz, with rows normalized to sum to D50 white point
+        const auto & m = params->camXyz;
+        double det = m[0][0] * (m[1][1]*m[2][2] - m[1][2]*m[2][1])
+                   - m[0][1] * (m[1][0]*m[2][2] - m[1][2]*m[2][0])
+                   + m[0][2] * (m[1][0]*m[2][1] - m[1][1]*m[2][0]);
+        if (std::abs(det) > 1e-10) {
+            double inv[3][3];
+            inv[0][0] = (m[1][1]*m[2][2] - m[1][2]*m[2][1]) / det;
+            inv[0][1] = (m[0][2]*m[2][1] - m[0][1]*m[2][2]) / det;
+            inv[0][2] = (m[0][1]*m[1][2] - m[0][2]*m[1][1]) / det;
+            inv[1][0] = (m[1][2]*m[2][0] - m[1][0]*m[2][2]) / det;
+            inv[1][1] = (m[0][0]*m[2][2] - m[0][2]*m[2][0]) / det;
+            inv[1][2] = (m[0][2]*m[1][0] - m[0][0]*m[1][2]) / det;
+            inv[2][0] = (m[1][0]*m[2][1] - m[1][1]*m[2][0]) / det;
+            inv[2][1] = (m[0][1]*m[2][0] - m[0][0]*m[2][1]) / det;
+            inv[2][2] = (m[0][0]*m[1][1] - m[0][1]*m[1][0]) / det;
+
+            static const double d50[3] = { 0.9642, 1.0, 0.8249 };
+            double fwd[3][3];
+            for (int row = 0; row < 3; ++row) {
+                double rowSum = inv[row][0] + inv[row][1] + inv[row][2];
+                if (std::abs(rowSum) > 1e-10) {
+                    for (int col = 0; col < 3; ++col)
+                        fwd[row][col] = inv[row][col] * d50[row] / rowSum;
+                } else {
+                    for (int col = 0; col < 3; ++col)
+                        fwd[row][col] = 0.0;
+                }
+            }
+
+            int32_t forwardMatrix[18];
+            for (int row = 0, i = 0; row < 3; ++row) {
+                for (int col = 0; col < 3; ++col) {
+                    forwardMatrix[i++] = static_cast<int32_t>(std::round(fwd[row][col] * 10000.0));
+                    forwardMatrix[i++] = 10000;
+                }
+            }
+            mainIFD.addEntry(FORWARDMATRIX1, IFD::SRATIONAL, 9, forwardMatrix);
+        }
+    }
+
+    // Dual-illuminant passthrough for DNG inputs
+    if (params->hasDualIlluminant) {
+        mainIFD.addEntry(CALIBRATIONILLUMINANT2, IFD::SHORT, params->illuminant2);
+
+        // ColorMatrix2
+        int32_t cm2[24];
+        for (int row = 0, i = 0; row < params->colors; ++row) {
+            for (int col = 0; col < 3; ++col) {
+                cm2[i++] = std::round(params->colorMatrix2[row][col] * 10000.0f);
+                cm2[i++] = 10000;
+            }
+        }
+        mainIFD.addEntry(COLORMATRIX2, IFD::SRATIONAL, params->colors * 3, cm2);
+
+        // ForwardMatrix2
+        bool hasF2 = false;
+        for (int i = 0; i < 3 && !hasF2; ++i)
+            for (int j = 0; j < params->colors && !hasF2; ++j)
+                if (params->forwardMatrix2[i][j] != 0.0f) hasF2 = true;
+        if (hasF2) {
+            int32_t fm2[24];
+            for (int row = 0, i = 0; row < 3; ++row) {
+                for (int col = 0; col < params->colors; ++col) {
+                    fm2[i++] = static_cast<int32_t>(std::round(
+                        params->forwardMatrix2[row][col] * 10000.0));
+                    fm2[i++] = 10000;
+                }
+            }
+            mainIFD.addEntry(FORWARDMATRIX2, IFD::SRATIONAL, 3 * params->colors, fm2);
+        }
+
+        // CameraCalibration1/2
+        bool hasCal1 = false, hasCal2 = false;
+        for (int i = 0; i < params->colors && !hasCal1; ++i)
+            for (int j = 0; j < params->colors && !hasCal1; ++j)
+                if (params->calibration1[i][j] != (i == j ? 1.0f : 0.0f)) hasCal1 = true;
+        for (int i = 0; i < params->colors && !hasCal2; ++i)
+            for (int j = 0; j < params->colors && !hasCal2; ++j)
+                if (params->calibration2[i][j] != (i == j ? 1.0f : 0.0f)) hasCal2 = true;
+        if (hasCal1) {
+            int32_t cal1[32];
+            for (int row = 0, i = 0; row < params->colors; ++row) {
+                for (int col = 0; col < params->colors; ++col) {
+                    cal1[i++] = static_cast<int32_t>(std::round(
+                        params->calibration1[row][col] * 10000.0));
+                    cal1[i++] = 10000;
+                }
+            }
+            mainIFD.addEntry(CAMERACALIBRATION1, IFD::SRATIONAL,
+                             params->colors * params->colors, cal1);
+        }
+        if (hasCal2) {
+            int32_t cal2[32];
+            for (int row = 0, i = 0; row < params->colors; ++row) {
+                for (int col = 0; col < params->colors; ++col) {
+                    cal2[i++] = static_cast<int32_t>(std::round(
+                        params->calibration2[row][col] * 10000.0));
+                    cal2[i++] = 10000;
+                }
+            }
+            mainIFD.addEntry(CAMERACALIBRATION2, IFD::SRATIONAL,
+                             params->colors * params->colors, cal2);
+        }
+    }
+
     // Color
     uint32_t analogBalance[] = { 1, 1, 1, 1, 1, 1, 1, 1 };
     mainIFD.addEntry(ANALOGBALANCE, IFD::RATIONAL, params->colors, analogBalance);
-    double wb[] = { 1.0/params->camMul[0], 1.0/params->camMul[1], 1.0/params->camMul[2], 1.0/params->camMul[3] };
-    uint32_t cameraNeutral[] = {
-        (uint32_t)std::round(1000000.0 * wb[0]), 1000000,
-        (uint32_t)std::round(1000000.0 * wb[1]), 1000000,
-        (uint32_t)std::round(1000000.0 * wb[2]), 1000000,
-        (uint32_t)std::round(1000000.0 * wb[3]), 1000000};
+    uint32_t cameraNeutral[8];
+    if (params->hasAsShotNeutral) {
+        for (int c = 0; c < params->colors; ++c) {
+            cameraNeutral[c*2]   = static_cast<uint32_t>(std::round(1000000.0 * params->asShotNeutral[c]));
+            cameraNeutral[c*2+1] = 1000000;
+        }
+    } else {
+        for (int c = 0; c < params->colors; ++c) {
+            cameraNeutral[c*2]   = static_cast<uint32_t>(std::round(1000000.0 / params->camMul[c]));
+            cameraNeutral[c*2+1] = 1000000;
+        }
+    }
     mainIFD.addEntry(CAMERANEUTRAL, IFD::RATIONAL, params->colors, cameraNeutral);
     mainIFD.addEntry(ORIENTATION, IFD::SHORT, params->tiffOrientation);
     mainIFD.addEntry(UNIQUENAME, params->maker + " " + params->model);
     // TODO: Add Digest and Unique ID
+
+    // BaselineExposure (SRATIONAL) — EV shift for default rendering brightness
+    if (baselineExposureEV != 0.0) {
+        int32_t bleData[2] = {
+            static_cast<int32_t>(std::round(baselineExposureEV * 10000.0)),
+            10000
+        };
+        mainIFD.addEntry(BASELINEEXPOSURE, IFD::SRATIONAL, 1, bleData);
+    }
+
+    // DefaultBlackRender = None — tell ACR to skip automatic black-point subtraction
+    mainIFD.addEntry(DEFAULTBLACKRENDER, IFD::LONG, (uint32_t)1);
+
+    // BaselineNoise (RATIONAL) — relative noise (1/sqrt(N) for N merged exposures)
+    if (baselineNoiseRatio < 1.0) {
+        uint32_t bnData[2] = {
+            static_cast<uint32_t>(std::round(baselineNoiseRatio * 1000000.0)),
+            1000000
+        };
+        mainIFD.addEntry(BASELINENOISE, IFD::RATIONAL, 1, bnData);
+    }
+
+    // NoiseProfile (DOUBLE) — per-channel noise model: variance = S*signal + O
+    if (noiseProfileColors > 0 && noiseProfileData[0] > 0.0) {
+        mainIFD.addEntry(NOISEPROFILE, IFD::DOUBLE, noiseProfileColors * 2, noiseProfileData);
+    }
+
     mainIFD.addEntry(SUBIFDS, IFD::LONG, previewWidth > 0 ? 2 : 1, subIFDoffsets);
 
     // Thumbnail
@@ -283,8 +512,12 @@ void DngFloatWriter::createRawIFD() {
         rawIFD.addEntry(FILLORDER, IFD::SHORT, 1);
     }
     rawIFD.addEntry(PLANARCONFIG, IFD::SHORT, 1);
-    rawIFD.addEntry(COMPRESSION, IFD::SHORT, TIFF_DEFLATE);
-    rawIFD.addEntry(PREDICTOR, IFD::SHORT, TIFF_FP2XPREDICTOR);
+    if (useJXL) {
+        rawIFD.addEntry(COMPRESSION, IFD::SHORT, TIFF_JXL);
+    } else {
+        rawIFD.addEntry(COMPRESSION, IFD::SHORT, TIFF_DEFLATE);
+        rawIFD.addEntry(PREDICTOR, IFD::SHORT, TIFF_FP2XPREDICTOR);
+    }
     rawIFD.addEntry(SAMPLEFORMAT, IFD::SHORT, TIFF_FPFORMAT);
 
     calculateTiles();
@@ -372,17 +605,30 @@ size_t DngFloatWriter::previewSize() {
 }
 
 
-void DngFloatWriter::writePreviews() {
+bool DngFloatWriter::writePreviewsToFile(FILE * f, size_t dataOffset) {
+    size_t filePos = dataOffset;
+
+    // Thumbnail
     size_t ts = thumbSize();
     mainIFD.setValue(STRIPBYTES, ts);
-    mainIFD.setValue(STRIPOFFSETS, pos);
-    pos = std::copy_n((const uint8_t *)thumbnail.bits(), ts, &fileData[pos]) - fileData.get();
-    if (previewWidth > 0) {
-        ts = previewSize();
-        previewIFD.setValue(STRIPBYTES, ts);
-        previewIFD.setValue(STRIPOFFSETS, pos);
-        pos = std::copy_n((const uint8_t *)jpegPreviewData.constData(), ts, &fileData[pos]) - fileData.get();
+    mainIFD.setValue(STRIPOFFSETS, (uint32_t)filePos);
+    if (fwrite(thumbnail.bits(), 1, ts, f) != ts) {
+        std::cerr << "DNG: failed writing thumbnail" << std::endl;
+        return false;
     }
+    filePos += ts;
+
+    // Preview JPEG
+    if (previewWidth > 0) {
+        size_t ps = previewSize();
+        previewIFD.setValue(STRIPBYTES, ps);
+        previewIFD.setValue(STRIPOFFSETS, (uint32_t)filePos);
+        if (fwrite(jpegPreviewData.constData(), 1, ps, f) != ps) {
+            std::cerr << "DNG: failed writing preview JPEG" << std::endl;
+            return false;
+        }
+    }
+    return true;
 }
 
 
@@ -524,35 +770,166 @@ static void compressFloats(Bytef * dst, int tileWidth, int bytesps) {
 }
 
 
-size_t DngFloatWriter::rawSize() {
-    // Worst case: DEFLATE can expand data slightly for incompressible input.
-    // Add ~0.1% + 32 bytes per tile for zlib/DEFLATE overhead.
-    size_t uncompressed = tilesAcross * tilesDown * tileWidth * tileLength * (bps >> 3);
-    size_t overhead = tilesAcross * tilesDown * 64;
-    return uncompressed + overhead;
-}
-
-
-void DngFloatWriter::writeRawData() {
+bool DngFloatWriter::writeRawDataToFile(FILE * f) {
+    // Note: Classic TIFF uses 32-bit offsets, limiting file size to 4 GiB.
+    // DNG inherits this limit. BigTIFF (64-bit offsets) is not supported.
     size_t tileCount = tilesAcross * tilesDown;
-    uint32_t tileOffsets[tileCount];
-    uint32_t tileBytes[tileCount];
+    std::vector<uint32_t> tileOffsets(tileCount);
+    std::vector<uint32_t> tileByteCounts(tileCount);
     int bytesps = bps >> 3;
     uLongf dstLen = tileWidth * tileLength * bytesps;
 
+#ifdef HAVE_LIBJXL
+    if (useJXL) {
+        int jxlEffort = std::max(1, std::min(9, (compressionLevel * 9 + 6) / 12));
+        bool writeError = false;
+
+        #pragma omp parallel
+        {
+            JxlEncoder* enc = JxlEncoderCreate(nullptr);
+            std::vector<uint16_t> tileBuf(tileWidth * tileLength);
+            std::vector<uint8_t> outBuf(dstLen);
+
+            #pragma omp for collapse(2) schedule(dynamic)
+            for (size_t y = 0; y < height; y += tileLength) {
+                for (size_t x = 0; x < width; x += tileWidth) {
+                    if (writeError) continue;
+
+                    size_t t = (y / tileLength) * tilesAcross + (x / tileWidth);
+                    size_t thisTileLength = y + tileLength > height ? height - y : tileLength;
+                    size_t thisTileWidth = x + tileWidth > width ? width - x : tileWidth;
+
+                    // Zero-fill for boundary tile padding (DNG requires full tile dimensions)
+                    if (thisTileLength != tileLength || thisTileWidth != tileWidth) {
+                        std::fill(tileBuf.begin(), tileBuf.end(), 0);
+                    }
+
+                    // Convert float32 → float16 in-place, pack at full tile stride
+                    for (size_t row = 0; row < thisTileLength; ++row) {
+                        Bytef * src = (Bytef *)&rawData(x, y+row);
+                        compressFloats(src, thisTileWidth, bytesps);
+                        memcpy(tileBuf.data() + row * tileWidth,
+                               src, thisTileWidth * sizeof(uint16_t));
+                    }
+
+                    // Encode full tile with JPEG XL
+                    JxlEncoderReset(enc);
+
+                    JxlBasicInfo info;
+                    JxlEncoderInitBasicInfo(&info);
+                    info.xsize = tileWidth;
+                    info.ysize = tileLength;
+                    info.bits_per_sample = 16;
+                    info.exponent_bits_per_sample = 5;
+                    info.num_color_channels = 1;
+                    info.num_extra_channels = 0;
+                    info.uses_original_profile = JXL_TRUE;
+                    if (JxlEncoderSetBasicInfo(enc, &info) != JXL_ENC_SUCCESS) {
+                        std::cerr << "DNG JXL: SetBasicInfo failed for tile " << t << std::endl;
+                        writeError = true;
+                        continue;
+                    }
+
+                    JxlColorEncoding colorEnc;
+                    JxlColorEncodingSetToLinearSRGB(&colorEnc, JXL_TRUE);
+                    JxlEncoderSetColorEncoding(enc, &colorEnc);
+
+                    JxlEncoderFrameSettings* fs = JxlEncoderFrameSettingsCreate(enc, nullptr);
+                    JxlEncoderSetFrameLossless(fs, JXL_TRUE);
+                    JxlEncoderFrameSettingsSetOption(fs,
+                        JXL_ENC_FRAME_SETTING_EFFORT, jxlEffort);
+                    JxlEncoderUseContainer(enc, JXL_FALSE);
+
+                    JxlPixelFormat pixFmt = {};
+                    pixFmt.num_channels = 1;
+                    pixFmt.data_type = JXL_TYPE_FLOAT16;
+                    pixFmt.endianness = JXL_NATIVE_ENDIAN;
+                    pixFmt.align = 0;
+
+                    size_t pixelDataSize = tileWidth * tileLength * sizeof(uint16_t);
+                    if (JxlEncoderAddImageFrame(fs, &pixFmt,
+                            tileBuf.data(), pixelDataSize) != JXL_ENC_SUCCESS) {
+                        std::cerr << "DNG JXL: AddImageFrame failed for tile " << t << std::endl;
+                        writeError = true;
+                        continue;
+                    }
+                    JxlEncoderCloseInput(enc);
+
+                    // Collect compressed output
+                    outBuf.resize(pixelDataSize);
+                    uint8_t* nextOut = outBuf.data();
+                    size_t availOut = outBuf.size();
+                    JxlEncoderStatus status;
+                    while ((status = JxlEncoderProcessOutput(enc, &nextOut, &availOut))
+                            == JXL_ENC_NEED_MORE_OUTPUT) {
+                        size_t written = nextOut - outBuf.data();
+                        outBuf.resize(outBuf.size() * 2);
+                        nextOut = outBuf.data() + written;
+                        availOut = outBuf.size() - written;
+                    }
+
+                    if (status != JXL_ENC_SUCCESS) {
+                        std::cerr << "DNG JXL: Failed encoding tile " << t << std::endl;
+                        writeError = true;
+                        continue;
+                    }
+
+                    size_t compressedLength = nextOut - outBuf.data();
+                    tileByteCounts[t] = compressedLength;
+                    #pragma omp critical
+                    {
+                        if (!writeError) {
+                            long filePos = ftell(f);
+                            if (filePos < 0) {
+                                std::cerr << "DNG: ftell failed for tile " << t << std::endl;
+                                writeError = true;
+                            } else if ((unsigned long)filePos > UINT32_MAX) {
+                                std::cerr << "DNG: file exceeds 4 GiB TIFF limit at tile " << t << std::endl;
+                                writeError = true;
+                            } else {
+                                tileOffsets[t] = (uint32_t)filePos;
+                                if (fwrite(outBuf.data(), 1, compressedLength, f) != compressedLength) {
+                                    std::cerr << "DNG: fwrite failed for tile " << t << std::endl;
+                                    writeError = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            JxlEncoderDestroy(enc);
+        }
+
+        if (writeError) return false;
+
+        rawIFD.setValue(TILEOFFSETS, (const uint32_t *)tileOffsets.data());
+        rawIFD.setValue(TILEBYTES, (const uint32_t *)tileByteCounts.data());
+        return true;
+    }
+#endif
+
 #ifdef HAVE_LIBDEFLATE
-    // Create one compressor per thread (libdeflate instances are not thread-safe)
     int nThreads = 1;
     #ifdef _OPENMP
     nThreads = omp_get_max_threads();
     #endif
-    std::vector<struct libdeflate_compressor*> compressors(nThreads);
+    std::vector<struct libdeflate_compressor*> compressors(nThreads, nullptr);
     for (int i = 0; i < nThreads; i++)
         compressors[i] = libdeflate_alloc_compressor(compressionLevel);
+    for (int i = 0; i < nThreads; i++) {
+        if (!compressors[i]) {
+            std::cerr << "DNG: libdeflate_alloc_compressor failed for thread " << i << std::endl;
+            for (auto c : compressors) if (c) libdeflate_free_compressor(c);
+            return false;
+        }
+    }
     size_t cBufLen = libdeflate_zlib_compress_bound(compressors[0], dstLen);
 #else
-    size_t cBufLen = dstLen;
+    size_t cBufLen = compressBound(dstLen);
 #endif
+
+    bool writeError = false;
 
     #pragma omp parallel
     {
@@ -562,6 +939,8 @@ void DngFloatWriter::writeRawData() {
         #pragma omp for collapse(2) schedule(dynamic)
         for (size_t y = 0; y < height; y += tileLength) {
             for (size_t x = 0; x < width; x += tileWidth) {
+                if (writeError) continue;
+
                 size_t t = (y / tileLength) * tilesAcross + (x / tileWidth);
                 size_t thisTileLength = y + tileLength > height ? height - y : tileLength;
                 size_t thisTileWidth = x + tileWidth > width ? width - x : tileWidth;
@@ -571,35 +950,57 @@ void DngFloatWriter::writeRawData() {
                 for (size_t row = 0; row < thisTileLength; ++row) {
                     Bytef * dst = uBuffer + row*tileWidth*bytesps;
                     Bytef * src = (Bytef *)&rawData(x, y+row);
+                    // Safe to modify rawData in-place: each tile covers a non-overlapping
+                    // region of the pixel grid, so concurrent threads never touch the same pixels.
                     compressFloats(src, thisTileWidth, bytesps);
                     encodeFPDeltaRow(src, dst, thisTileWidth, tileWidth, bytesps, 2);
                 }
+
+                size_t compressedLength = 0;
+                bool compressOK = false;
 #ifdef HAVE_LIBDEFLATE
                 int tid = 0;
                 #ifdef _OPENMP
                 tid = omp_get_thread_num();
                 #endif
-                size_t compressedLength = libdeflate_zlib_compress(
+                compressedLength = libdeflate_zlib_compress(
                     compressors[tid], uBuffer, dstLen, cBuffer, cBufLen);
-                tileBytes[t] = compressedLength;
-                if (compressedLength == 0) {
+                compressOK = (compressedLength != 0);
+                if (!compressOK) {
                     std::cerr << "DNG Deflate: Failed compressing tile " << t << std::endl;
                 }
 #else
-                uLongf conpressedLength = dstLen;
-                int err = compress(cBuffer, &conpressedLength, uBuffer, dstLen);
-                tileBytes[t] = conpressedLength;
-                if (err != Z_OK) {
+                uLongf zlibLen = dstLen;
+                int err = compress(cBuffer, &zlibLen, uBuffer, dstLen);
+                compressedLength = zlibLen;
+                compressOK = (err == Z_OK);
+                if (!compressOK) {
                     std::cerr << "DNG Deflate: Failed compressing tile " << t << ", with error " << err << std::endl;
                 }
 #endif
-                else {
+                if (compressOK) {
+                    tileByteCounts[t] = compressedLength;
                     #pragma omp critical
                     {
-                        tileOffsets[t] = pos;
-                        std::copy_n((const uint8_t *)cBuffer, tileBytes[t], &fileData[pos]);
-                        pos += tileBytes[t];
+                        if (!writeError) {
+                            long filePos = ftell(f);
+                            if (filePos < 0) {
+                                std::cerr << "DNG: ftell failed for tile " << t << std::endl;
+                                writeError = true;
+                            } else if ((unsigned long)filePos > UINT32_MAX) {
+                                std::cerr << "DNG: file exceeds 4 GiB TIFF limit at tile " << t << std::endl;
+                                writeError = true;
+                            } else {
+                                tileOffsets[t] = (uint32_t)filePos;
+                                if (fwrite(cBuffer, 1, tileByteCounts[t], f) != tileByteCounts[t]) {
+                                    std::cerr << "DNG: fwrite failed for tile " << t << std::endl;
+                                    writeError = true;
+                                }
+                            }
+                        }
                     }
+                } else {
+                    writeError = true;
                 }
             }
         }
@@ -612,8 +1013,11 @@ void DngFloatWriter::writeRawData() {
     for (auto c : compressors) libdeflate_free_compressor(c);
 #endif
 
-    rawIFD.setValue(TILEOFFSETS, tileOffsets);
-    rawIFD.setValue(TILEBYTES, tileBytes);
+    if (writeError) return false;
+
+    rawIFD.setValue(TILEOFFSETS, (const uint32_t *)tileOffsets.data());
+    rawIFD.setValue(TILEBYTES, (const uint32_t *)tileByteCounts.data());
+    return true;
 }
 
 } // namespace hdrmerge

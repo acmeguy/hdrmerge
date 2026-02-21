@@ -29,6 +29,8 @@
 #include <libraw.h>
 #include "ImageIO.hpp"
 #include "DngFloatWriter.hpp"
+#include "AdaptiveCurves.hpp"
+#include "Resizer.hpp"
 #include "Log.hpp"
 using namespace std;
 using namespace hdrmerge;
@@ -77,8 +79,14 @@ ImageIO::QDateInterval ImageIO::getImageCreationInterval(const QString & fileNam
     std::unique_ptr<LibRaw> rawProcessor(new LibRaw);
     QDateInterval result;
     if (rawProcessor->open_file(fileName.toLocal8Bit().constData()) == LIBRAW_SUCCESS) {
-        result.end = QDateTime::fromTime_t(rawProcessor->imgdata.other.timestamp);
-        result.start = result.end.addMSecs(-rawProcessor->imgdata.other.shutter * 1000.0);
+        auto & other = rawProcessor->imgdata.other;
+        result.end = QDateTime::fromTime_t(other.timestamp);
+        result.start = result.end.addMSecs(-other.shutter * 1000.0);
+        float aperture = other.aperture;
+        if (aperture <= 0.0f || std::isinf(aperture) || std::isnan(aperture))
+            aperture = 8.0f;
+        if (other.iso_speed > 0 && other.shutter > 0)
+            result.ev = std::log2(other.iso_speed * other.shutter / (100.0 * aperture * aperture));
     }
     return result;
 }
@@ -182,15 +190,42 @@ void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
     string cropped = stack.isCropped() ? " cropped" : "";
     Log::msg(2, "Writing ", options.fileName, ", ", options.bps, "-bit, ", stack.getWidth(), 'x', stack.getHeight(), cropped);
 
-    progress.advance(0, "Rendering image");
     RawParameters params = *rawParameters.back();
     params.width = stack.getWidth();
     params.height = stack.getHeight();
+
+    if (options.hotPixelSigma > 0.0f) {
+        progress.advance(0, "Correcting hot pixels");
+        stack.correctHotPixels(params, options.hotPixelSigma);
+    }
+
+    progress.advance(5, "Rendering image");
     params.adjustWhite(stack.getImage(stack.size() - 1));
-    Array2D<float> composedImage = stack.compose(params, options.featherRadius, options.deghostSigma);
+    ComposeResult composed = stack.compose(params, options.featherRadius,
+                                             options.deghostSigma,
+                                             options.clipPercentile,
+                                             options.subPixelAlign);
+
+    if (options.resizeLong > 0) {
+        progress.advance(20, "Resizing image");
+        ResizeResult resized = resizeCFA(std::move(composed.image),
+            params.rawWidth, params.rawHeight, params.width, params.height,
+            params.topMargin, params.leftMargin, options.resizeLong, params.FC);
+        composed.image = std::move(resized.image);
+        params.rawWidth = resized.rawWidth;  params.rawHeight = resized.rawHeight;
+        params.width = resized.width;        params.height = resized.height;
+        params.topMargin = resized.topMargin; params.leftMargin = resized.leftMargin;
+    }
 
     progress.advance(33, "Rendering preview");
-    QImage preview = renderPreview(composedImage, params, stack.getMaxExposure(), options.previewSize <= 1);
+    QImage preview = renderPreview(composed.image, params, stack.getMaxExposure(), options.previewSize <= 1);
+
+    AdaptiveCurves adaptiveCurves;
+    if (options.autoCurves) {
+        progress.advance(40, "Generating adaptive curves");
+        QString modelPath = findOnnxModel();
+        adaptiveCurves = predictAdaptiveCurves(preview, modelPath);
+    }
 
     progress.advance(66, "Writing output");
     DngFloatWriter writer;
@@ -198,7 +233,14 @@ void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
     writer.setCompressionLevel(options.compressionLevel);
     writer.setPreviewWidth((options.previewSize * stack.getWidth()) / 2);
     writer.setPreview(preview);
-    writer.write(std::move(composedImage), params, options.fileName);
+    double finalEV = composed.baselineExposureEV + options.evShift;
+    finalEV = std::max(-10.0, std::min(10.0, finalEV));
+    writer.setBaselineExposure(finalEV);
+    writer.setBaselineNoise(composed.numImages);
+    writer.setNoiseProfile(composed.noiseProfile, params.colors);
+    writer.setACRProfilePath(options.acrProfilePath);
+    writer.setAdaptiveCurves(adaptiveCurves);
+    writer.write(std::move(composed.image), params, options.fileName);
     progress.advance(100, "Done writing!");
 
     if (options.saveMask) {

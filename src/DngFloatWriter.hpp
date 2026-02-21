@@ -23,11 +23,14 @@
 #ifndef _DNGFLOATWRITER_HPP_
 #define _DNGFLOATWRITER_HPP_
 
+#include <cstdio>
+#include <cmath>
 #include <QString>
 #include <QImage>
 #include "config.h"
 #include "Array2D.hpp"
 #include "TiffDirectory.hpp"
+#include "ExifTransfer.hpp"
 
 namespace hdrmerge {
 
@@ -46,6 +49,19 @@ public:
     void setCompressionLevel(int level) {
         compressionLevel = level;
     }
+    void setBaselineExposure(double ev) { baselineExposureEV = ev; }
+    void setBaselineNoise(int numImages) {
+        baselineNoiseRatio = (numImages > 1)
+            ? 1.0 / std::sqrt(static_cast<double>(numImages))
+            : 1.0;
+    }
+    void setNoiseProfile(const double * profile, int colors) {
+        noiseProfileColors = colors;
+        for (int i = 0; i < colors * 2; ++i)
+            noiseProfileData[i] = profile[i];
+    }
+    void setACRProfilePath(const QString & path) { acrProfilePath = path; }
+    void setAdaptiveCurves(const AdaptiveCurves & c) { adaptiveCurves = c; }
     void setPreview(const QImage & p);
     void write(Array2D<float> && rawPixels, const RawParameters & p, const QString & dstFileName);
 
@@ -53,10 +69,15 @@ private:
     int previewWidth;
     int bps;
     int compressionLevel;
+    bool useJXL = false;
+    double baselineExposureEV = 0.0;
+    double baselineNoiseRatio = 1.0;
+    double noiseProfileData[8] = {};
+    int noiseProfileColors = 0;
+    QString acrProfilePath;
+    AdaptiveCurves adaptiveCurves;
     const RawParameters * params;
     Array2D<float> rawData;
-    std::unique_ptr<uint8_t[]> fileData;
-    size_t pos;
     IFD mainIFD, rawIFD, previewIFD;
     uint32_t width, height;
     uint32_t tileWidth, tileLength;
@@ -69,13 +90,12 @@ private:
     void createMainIFD();
     void createRawIFD();
     void calculateTiles();
-    void writeRawData();
+    bool writePreviewsToFile(FILE * f, size_t dataOffset);
+    bool writeRawDataToFile(FILE * f);
     void renderPreviews();
-    void writePreviews();
     void createPreviewIFD();
     size_t thumbSize();
     size_t previewSize();
-    size_t rawSize();
 };
 
 } // namespace hdrmerge

@@ -22,82 +22,192 @@
 
 #include <exiv2/exiv2.hpp>
 #include <iostream>
+#include <QFile>
 #include "ExifTransfer.hpp"
-#include "Log.hpp"
 using namespace hdrmerge;
 using namespace Exiv2;
 using namespace std;
 
-
-class ExifTransfer {
-public:
-    ExifTransfer(const QString & srcFile, const QString & dstFile,
-                 const uint8_t * data, size_t dataSize)
-    : srcFile(srcFile), dstFile(dstFile), data(data), dataSize(dataSize) {}
-
-    void copyMetadata();
-
-private:
-    QString srcFile, dstFile;
-    const uint8_t * data;
-    size_t dataSize;
 #if EXIV2_TEST_VERSION(0,28,0)
-    Exiv2::Image::UniquePtr src, dst;
+using ExivImagePtr = Exiv2::Image::UniquePtr;
+using ExivValuePtr = Exiv2::Value::UniquePtr;
 #else
-    Exiv2::Image::AutoPtr src, dst;
+using ExivImagePtr = Exiv2::Image::AutoPtr;
+using ExivValuePtr = Exiv2::Value::AutoPtr;
 #endif
 
-    void copyXMP();
-    void copyIPTC();
-    void copyEXIF();
-};
+static bool excludeExifDatum(const Exiv2::Exifdatum & datum);
+static void copyXMP(Exiv2::Image & src, Exiv2::Image & dst);
+static void copyIPTC(Exiv2::Image & src, Exiv2::Image & dst);
+static void copyEXIF(Exiv2::Image & src, Exiv2::Image & dst);
+static void synthesizeLensXMP(Exiv2::Image & src, Exiv2::Image & dst);
 
-
-void hdrmerge::Exif::transfer(const QString & srcFile, const QString & dstFile,
-                 const uint8_t * data, size_t dataSize) {
-    ExifTransfer exif(srcFile, dstFile, data, dataSize);
-    exif.copyMetadata();
+static void copyAllMetadata(ExivImagePtr & src, ExivImagePtr & dst) {
+    copyXMP(*src, *dst);
+    copyIPTC(*src, *dst);
+    copyEXIF(*src, *dst);
+    synthesizeLensXMP(*src, *dst);
 }
 
 
-void ExifTransfer::copyMetadata() {
+static void injectACRProfile(Exiv2::Image & dst, const QString & profilePath) {
+    if (profilePath.isEmpty()) return;
     try {
-#if EXIV2_TEST_VERSION(0,28,0)
-        dst = Exiv2::ImageFactory::open(BasicIo::UniquePtr(new MemIo(data, dataSize)));
-#else
-        dst = Exiv2::ImageFactory::open(BasicIo::AutoPtr(new MemIo(data, dataSize)));
-#endif
-        dst->readMetadata();
+        ExivImagePtr xmpFile = Exiv2::ImageFactory::open(profilePath.toLocal8Bit().constData());
+        xmpFile->readMetadata();
+        const Exiv2::XmpData & srcXmp = xmpFile->xmpData();
+        Exiv2::XmpData & dstXmp = dst.xmpData();
+        for (const auto & datum : srcXmp) {
+            if (datum.groupName() == "crs") {
+                auto it = dstXmp.findKey(Exiv2::XmpKey(datum.key()));
+                if (it != dstXmp.end()) {
+                    dstXmp.erase(it);
+                }
+                dstXmp.add(datum);
+            }
+        }
     } catch (Exiv2::Error & e) {
-        std::cerr << "Exiv2 error: " << e.what() << std::endl;
-        return;
-    }
-    try {
-        src = Exiv2::ImageFactory::open(srcFile.toLocal8Bit().constData());
-        src->readMetadata();
-        copyXMP();
-        copyIPTC();
-        copyEXIF();
-    } catch (Exiv2::Error & e) {
-        std::cerr << "Exiv2 error: " << e.what() << std::endl;
-        // At least we have to set the SubImage1 file type to Primary Image
-        dst->exifData()["Exif.SubImage1.NewSubfileType"] = 0;
-    }
-    try {
-        dst->writeMetadata();
-        FileIo fileIo(dstFile.toLocal8Bit().constData());
-        fileIo.open("wb");
-        fileIo.write(dst->io());
-        fileIo.close();
-    } catch (Exiv2::Error & e) {
-        std::cerr << "Exiv2 error: " << e.what() << std::endl;
+        std::cerr << "Exiv2 error reading ACR profile: " << e.what() << std::endl;
     }
 }
 
 
-void ExifTransfer::copyXMP() {
-    const Exiv2::XmpData & srcXmp = src->xmpData();
-    Exiv2::XmpData & dstXmp = dst->xmpData();
+static void injectDefaultHDRSettings(Exiv2::Image & dst) {
+    Exiv2::XmpData & xmp = dst.xmpData();
+
+    // setIfAbsent helper: only inject values not already present
+    auto setIfAbsent = [&](const char * key, const std::string & value) {
+        if (xmp.findKey(Exiv2::XmpKey(key)) == xmp.end()) {
+            xmp[key] = value;
+        }
+    };
+
+    setIfAbsent("Xmp.crs.ProcessVersion", "11.0");
+    setIfAbsent("Xmp.crs.HDREditMode", "1");
+    setIfAbsent("Xmp.crs.Highlights2012", "-100");
+    setIfAbsent("Xmp.crs.Shadows2012", "+100");
+    setIfAbsent("Xmp.crs.Whites2012", "-40");
+    setIfAbsent("Xmp.crs.Blacks2012", "+20");
+
+    // Tone curve (XMP seq) — only if not already present
+    const char * curveKey = "Xmp.crs.ToneCurvePV2012";
+    if (xmp.findKey(Exiv2::XmpKey(curveKey)) == xmp.end()) {
+        ExivValuePtr val = Exiv2::Value::create(Exiv2::xmpSeq);
+        val->read("0, 0");
+        val->read("64, 70");
+        val->read("128, 140");
+        val->read("192, 200");
+        val->read("255, 255");
+        xmp.add(Exiv2::XmpKey(curveKey), val.get());
+    }
+
+    setIfAbsent("Xmp.crs.ToneCurveName2012", "Custom");
+}
+
+
+static void injectAdaptiveCurves(Exiv2::Image & dst, const hdrmerge::AdaptiveCurves & curves) {
+    if (!curves.valid) return;
+    Exiv2::XmpData & xmp = dst.xmpData();
+
+    // Set master curve to linear
+    {
+        const char * key = "Xmp.crs.ToneCurvePV2012";
+        auto it = xmp.findKey(Exiv2::XmpKey(key));
+        if (it != xmp.end()) xmp.erase(it);
+        ExivValuePtr val = Exiv2::Value::create(Exiv2::xmpSeq);
+        val->read("0, 0");
+        val->read("255, 255");
+        xmp.add(Exiv2::XmpKey(key), val.get());
+    }
+
+    // Per-channel curves
+    struct ChannelCurve {
+        const char * key;
+        const std::vector<std::pair<int,int>> * points;
+    };
+    ChannelCurve channels[] = {
+        { "Xmp.crs.ToneCurvePV2012Red",   &curves.red },
+        { "Xmp.crs.ToneCurvePV2012Green", &curves.green },
+        { "Xmp.crs.ToneCurvePV2012Blue",  &curves.blue },
+    };
+    for (const auto & ch : channels) {
+        auto it = xmp.findKey(Exiv2::XmpKey(ch.key));
+        if (it != xmp.end()) xmp.erase(it);
+        ExivValuePtr val = Exiv2::Value::create(Exiv2::xmpSeq);
+        for (const auto & pt : *ch.points) {
+            std::string s = std::to_string(pt.first) + ", " + std::to_string(pt.second);
+            val->read(s);
+        }
+        xmp.add(Exiv2::XmpKey(ch.key), val.get());
+    }
+
+    // Mark as custom curve
+    {
+        const char * key = "Xmp.crs.ToneCurveName2012";
+        auto it = xmp.findKey(Exiv2::XmpKey(key));
+        if (it != xmp.end()) xmp.erase(it);
+        ExivValuePtr val = Exiv2::Value::create(Exiv2::xmpText);
+        val->read("Custom");
+        xmp.add(Exiv2::XmpKey(key), val.get());
+    }
+}
+
+
+static std::string trimString(const std::string & s) {
+    const std::string whitespace(" \t\r\n\0", 5);
+    size_t start = s.find_first_not_of(whitespace);
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(whitespace);
+    return s.substr(start, end - start + 1);
+}
+
+static void synthesizeLensXMP(Exiv2::Image & src, Exiv2::Image & dst) {
+    const Exiv2::ExifData & exif = src.exifData();
+    Exiv2::XmpData & xmp = dst.xmpData();
+
+    // Xmp.aux.Lens from Exif.Photo.LensModel
+    auto lensModel = exif.findKey(Exiv2::ExifKey("Exif.Photo.LensModel"));
+    if (lensModel != exif.end() && xmp.findKey(Exiv2::XmpKey("Xmp.aux.Lens")) == xmp.end()) {
+        xmp["Xmp.aux.Lens"] = trimString(lensModel->toString());
+    }
+
+    // Xmp.aux.LensInfo from Exif.Photo.LensSpecification as XMP seq of rationals
+    auto lensSpec = exif.findKey(Exiv2::ExifKey("Exif.Photo.LensSpecification"));
+    if (lensSpec != exif.end() && lensSpec->count() >= 4
+        && xmp.findKey(Exiv2::XmpKey("Xmp.aux.LensInfo")) == xmp.end()) {
+        ExivValuePtr val = Exiv2::Value::create(Exiv2::xmpSeq);
+        for (long i = 0; i < 4; ++i) {
+            val->read(lensSpec->toString(i));
+        }
+        xmp.add(Exiv2::XmpKey("Xmp.aux.LensInfo"), val.get());
+    }
+
+    // Xmp.aux.SerialNumber from Exif.Photo.BodySerialNumber
+    auto serial = exif.findKey(Exiv2::ExifKey("Exif.Photo.BodySerialNumber"));
+    if (serial != exif.end() && xmp.findKey(Exiv2::XmpKey("Xmp.aux.SerialNumber")) == xmp.end()) {
+        xmp["Xmp.aux.SerialNumber"] = trimString(serial->toString());
+    }
+
+    // Xmp.aux.LensSerialNumber from Exif.Photo.LensSerialNumber
+    auto lensSerial = exif.findKey(Exiv2::ExifKey("Exif.Photo.LensSerialNumber"));
+    if (lensSerial != exif.end() && xmp.findKey(Exiv2::XmpKey("Xmp.aux.LensSerialNumber")) == xmp.end()) {
+        xmp["Xmp.aux.LensSerialNumber"] = trimString(lensSerial->toString());
+    }
+
+    // Xmp.exifEX.LensMake and LensModel
+    auto lensMake = exif.findKey(Exiv2::ExifKey("Exif.Photo.LensMake"));
+    if (lensMake != exif.end() && xmp.findKey(Exiv2::XmpKey("Xmp.exifEX.LensMake")) == xmp.end()) {
+        xmp["Xmp.exifEX.LensMake"] = trimString(lensMake->toString());
+    }
+    if (lensModel != exif.end() && xmp.findKey(Exiv2::XmpKey("Xmp.exifEX.LensModel")) == xmp.end()) {
+        xmp["Xmp.exifEX.LensModel"] = trimString(lensModel->toString());
+    }
+}
+
+
+static void copyXMP(Exiv2::Image & src, Exiv2::Image & dst) {
+    const Exiv2::XmpData & srcXmp = src.xmpData();
+    Exiv2::XmpData & dstXmp = dst.xmpData();
     for (const auto & datum : srcXmp) {
         if (datum.groupName() != "tiff" && dstXmp.findKey(Exiv2::XmpKey(datum.key())) == dstXmp.end()) {
             dstXmp.add(datum);
@@ -106,9 +216,9 @@ void ExifTransfer::copyXMP() {
 }
 
 
-void ExifTransfer::copyIPTC() {
-    const Exiv2::IptcData & srcIptc = src->iptcData();
-    Exiv2::IptcData & dstIptc = dst->iptcData();
+static void copyIPTC(Exiv2::Image & src, Exiv2::Image & dst) {
+    const Exiv2::IptcData & srcIptc = src.iptcData();
+    Exiv2::IptcData & dstIptc = dst.iptcData();
     for (const auto & datum : srcIptc) {
         if (dstIptc.findKey(Exiv2::IptcKey(datum.key())) == dstIptc.end()) {
             dstIptc.add(datum);
@@ -153,7 +263,7 @@ static bool excludeExifDatum(const Exifdatum & datum) {
 }
 
 
-void ExifTransfer::copyEXIF() {
+static void copyEXIF(Exiv2::Image & src, Exiv2::Image & dst) {
     static const char * includeImageKeys[] = {
         // Correct Make and Model, from the input files
         // It is needed so that makernote tags are correctly copied
@@ -168,8 +278,8 @@ void ExifTransfer::copyEXIF() {
         "Exif.SubImage1.OpcodeList3"
     };
 
-    const Exiv2::ExifData & srcExif = src->exifData();
-    Exiv2::ExifData & dstExif = dst->exifData();
+    const Exiv2::ExifData & srcExif = src.exifData();
+    Exiv2::ExifData & dstExif = dst.exifData();
 
     for (const char * keyName : includeImageKeys) {
         auto iterator = srcExif.findKey(Exiv2::ExifKey(keyName));
@@ -185,5 +295,49 @@ void ExifTransfer::copyEXIF() {
         if (!excludeExifDatum(datum) && dstExif.findKey(Exiv2::ExifKey(datum.key())) == dstExif.end()) {
             dstExif.add(datum);
         }
+    }
+}
+
+
+void hdrmerge::Exif::transferFile(const QString & srcFile, const QString & tmpFile,
+                                   const QString & dstFile,
+                                   const QString & acrProfilePath,
+                                   const AdaptiveCurves & curves) {
+    ExivImagePtr dst, src;
+    try {
+        dst = Exiv2::ImageFactory::open(tmpFile.toLocal8Bit().constData());
+        dst->readMetadata();
+    } catch (Exiv2::Error & e) {
+        std::cerr << "Exiv2 error opening temp DNG: " << e.what() << std::endl;
+        QFile::remove(tmpFile);
+        return;
+    }
+    try {
+        src = Exiv2::ImageFactory::open(srcFile.toLocal8Bit().constData());
+        src->readMetadata();
+        copyAllMetadata(src, dst);
+    } catch (Exiv2::Error & e) {
+        std::cerr << "Exiv2 error: " << e.what() << std::endl;
+        dst->exifData()["Exif.SubImage1.NewSubfileType"] = 0;
+    }
+    // Inject hardcoded HDR defaults (setIfAbsent — won't override existing values)
+    injectDefaultHDRSettings(*dst);
+    // Inject ACR profile (overrides source metadata and defaults)
+    injectACRProfile(*dst, acrProfilePath);
+    // Inject adaptive curves (overrides profile's curves if present)
+    injectAdaptiveCurves(*dst, curves);
+    try {
+        dst->writeMetadata();
+    } catch (Exiv2::Error & e) {
+        std::cerr << "Exiv2 error writing metadata: " << e.what() << std::endl;
+        QFile::remove(tmpFile);
+        return;
+    }
+    dst.reset();
+    QFile::remove(dstFile);
+    if (!QFile::rename(tmpFile, dstFile)) {
+        std::cerr << "Failed to rename " << tmpFile.toLocal8Bit().constData()
+                   << " to " << dstFile.toLocal8Bit().constData() << std::endl;
+        QFile::remove(tmpFile);
     }
 }

@@ -54,6 +54,16 @@ if(LIBDEFLATE_LIBRARY AND LIBDEFLATE_INCLUDE_DIR)
 else()
     message(STATUS "libdeflate not found, falling back to zlib")
 endif()
+# libjxl for JPEG XL compression in DNG 1.7 (16-bit float only)
+find_library(LIBJXL_LIBRARY jxl PATHS /opt/homebrew/lib)
+find_library(LIBJXL_THREADS_LIBRARY jxl_threads PATHS /opt/homebrew/lib)
+find_path(LIBJXL_INCLUDE_DIR jxl/encode.h PATHS /opt/homebrew/include)
+if(LIBJXL_LIBRARY AND LIBJXL_INCLUDE_DIR)
+    message(STATUS "Found libjxl: ${LIBJXL_LIBRARY}")
+    add_definitions(-DHAVE_LIBJXL)
+else()
+    message(STATUS "libjxl not found, JPEG XL DNG compression disabled")
+endif()
 find_package(ZLIB REQUIRED)
 find_package(OpenMP)
 
@@ -64,6 +74,18 @@ if(OpenCV_FOUND)
     add_definitions(-DHAVE_OPENCV)
 else()
     message(STATUS "OpenCV not found: feature-based alignment disabled (MTB only)")
+endif()
+
+# Optional: ONNX Runtime for adaptive tone curves (--auto-curves)
+find_library(ONNXRUNTIME_LIBRARY onnxruntime PATHS /opt/homebrew/lib)
+find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+    PATHS /opt/homebrew/include/onnxruntime /opt/homebrew/include)
+if(ONNXRUNTIME_LIBRARY AND ONNXRUNTIME_INCLUDE_DIR)
+    message(STATUS "Found ONNX Runtime: ${ONNXRUNTIME_LIBRARY}")
+    add_definitions(-DHAVE_ONNXRUNTIME)
+    include_directories("${ONNXRUNTIME_INCLUDE_DIR}")
+else()
+    message(STATUS "ONNX Runtime not found: --auto-curves disabled")
 endif()
 
 # Commented-out as it doesn't link
@@ -80,8 +102,13 @@ include_directories(
     "${EXIV2_INCLUDE_DIR}"
     "${ZLIB_INCLUDE_DIRS}"
     "${ALGLIB_INCLUDES}"
-    "${LIBDEFLATE_INCLUDE_DIR}"
 )
+if(LIBDEFLATE_LIBRARY AND LIBDEFLATE_INCLUDE_DIR)
+    include_directories("${LIBDEFLATE_INCLUDE_DIR}")
+endif()
+if(LIBJXL_LIBRARY AND LIBJXL_INCLUDE_DIR)
+    include_directories("${LIBJXL_INCLUDE_DIR}")
+endif()
 
 if(NOT(CMAKE_BUILD_TYPE))
     set(CMAKE_BUILD_TYPE Release)
@@ -146,6 +173,8 @@ set(hdrmerge_sources
     src/BoxBlur.cpp
     src/ExifTransfer.cpp
     src/ImageIO.cpp
+    src/AdaptiveCurves.cpp
+    src/Resizer.cpp
 )
 
 set(hdrmerge_gui_sources
@@ -213,7 +242,6 @@ set(hdrmerge_libs
     "${LibRaw_r_LIBRARIES}"
     "${EXIV2_LIBRARY}"
     "${ZLIB_LIBRARIES}"
-    "${LIBDEFLATE_LIBRARY}"
 )
 
 if(WIN32)
@@ -301,7 +329,24 @@ endif()
 if(OpenCV_FOUND)
     set(hdrmerge_libs ${hdrmerge_libs} ${OpenCV_LIBS})
 endif()
+if(LIBDEFLATE_LIBRARY)
+    set(hdrmerge_libs ${hdrmerge_libs} ${LIBDEFLATE_LIBRARY})
+endif()
+if(LIBJXL_LIBRARY)
+    set(hdrmerge_libs ${hdrmerge_libs} ${LIBJXL_LIBRARY})
+    if(LIBJXL_THREADS_LIBRARY)
+        set(hdrmerge_libs ${hdrmerge_libs} ${LIBJXL_THREADS_LIBRARY})
+    endif()
+endif()
+if(ONNXRUNTIME_LIBRARY)
+    set(hdrmerge_libs ${hdrmerge_libs} ${ONNXRUNTIME_LIBRARY})
+endif()
 target_link_libraries(hdrmerge ${STRIP} ${hdrmerge_libs} Qt5::Widgets)
+
+option(NO_GUI "Disable GUI, CLI-only build" OFF)
+if(NO_GUI)
+    target_compile_definitions(hdrmerge PRIVATE NO_GUI)
+endif()
 
 if(WIN32)
     # Compile a target without GUI, for the .com executable
@@ -357,6 +402,51 @@ if(WIN32)
 elseif(APPLE)
     set_source_files_properties(data/images/icon.icns PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
     install(TARGETS hdrmerge BUNDLE DESTINATION ${CMAKE_INSTALL_BINDIR})
+    # Bundle libjxl and its transitive dependencies into the .app
+    if(LIBJXL_LIBRARY AND LIBJXL_INCLUDE_DIR)
+        set(BUNDLE_FW "$<TARGET_BUNDLE_DIR:hdrmerge>/Contents/Frameworks")
+        set(BUNDLE_EXE "$<TARGET_BUNDLE_DIR:hdrmerge>/Contents/MacOS/hdrmerge")
+        # Resolve symlinks to get the real versioned dylib paths
+        get_filename_component(LIBJXL_REAL "${LIBJXL_LIBRARY}" REALPATH)
+        get_filename_component(LIBJXL_THREADS_REAL "${LIBJXL_THREADS_LIBRARY}" REALPATH)
+        # Find transitive dependencies
+        get_filename_component(_jxl_lib_dir "${LIBJXL_REAL}" DIRECTORY)
+        find_library(LIBJXL_CMS_LIBRARY jxl_cms PATHS "${_jxl_lib_dir}" NO_DEFAULT_PATH)
+        find_library(LIBHWY_LIBRARY hwy PATHS /opt/homebrew/lib)
+        find_library(LIBBROTLIDEC_LIBRARY brotlidec PATHS /opt/homebrew/lib)
+        find_library(LIBBROTLIENC_LIBRARY brotlienc PATHS /opt/homebrew/lib)
+        find_library(LIBBROTLICOMMON_LIBRARY brotlicommon PATHS /opt/homebrew/lib)
+        find_library(LIBLCMS2_LIBRARY lcms2 PATHS /opt/homebrew/lib)
+        set(_jxl_bundle_libs
+            "${LIBJXL_REAL}"
+            "${LIBJXL_THREADS_REAL}"
+        )
+        foreach(_dep LIBJXL_CMS_LIBRARY LIBHWY_LIBRARY LIBBROTLIDEC_LIBRARY
+                     LIBBROTLIENC_LIBRARY LIBBROTLICOMMON_LIBRARY LIBLCMS2_LIBRARY)
+            if(${_dep})
+                get_filename_component(_real "${${_dep}}" REALPATH)
+                list(APPEND _jxl_bundle_libs "${_real}")
+            endif()
+        endforeach()
+        # Post-build: copy dylibs and rewrite load paths
+        add_custom_command(TARGET hdrmerge POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${BUNDLE_FW}"
+            COMMENT "Bundling libjxl dylibs into app bundle"
+        )
+        foreach(_lib ${_jxl_bundle_libs})
+            get_filename_component(_name "${_lib}" NAME)
+            add_custom_command(TARGET hdrmerge POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_lib}" "${BUNDLE_FW}/${_name}"
+                COMMAND chmod u+w "${BUNDLE_FW}/${_name}"
+                COMMAND install_name_tool -id "@executable_path/../Frameworks/${_name}" "${BUNDLE_FW}/${_name}"
+            )
+        endforeach()
+        # Rewrite load paths in the main executable and in each bundled dylib
+        add_custom_command(TARGET hdrmerge POST_BUILD
+            COMMAND ${CMAKE_SOURCE_DIR}/cmake/fix_jxl_rpaths.sh "${BUNDLE_EXE}" "${BUNDLE_FW}"
+            COMMENT "Fixing libjxl load paths"
+        )
+    endif()
 else()
     if(NOT DEFINED CMAKE_INSTALL_BINDIR)
         set(CMAKE_INSTALL_BINDIR "bin")

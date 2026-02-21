@@ -80,6 +80,20 @@ public:
     int flip;
     int tiffOrientation;
 
+    // DNG dual-illuminant passthrough (only populated for DNG inputs)
+    bool hasDualIlluminant = false;
+    uint16_t illuminant1 = 0, illuminant2 = 0;
+    float colorMatrix2[4][3] = {};
+    float forwardMatrix1Dng[3][4] = {};
+    float forwardMatrix2[3][4] = {};
+    float calibration1[4][4] = {};
+    float calibration2[4][4] = {};
+    bool hasForwardMatrix1Dng = false;
+
+    // AsShotNeutral from DNG (more accurate than computed 1/camMul)
+    float asShotNeutral[4] = {};
+    bool hasAsShotNeutral = false;
+
 private:
     void adjustBlack();
     void calculateCamXyz();

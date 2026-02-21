@@ -34,6 +34,13 @@
 
 namespace hdrmerge {
 
+struct ComposeResult {
+    Array2D<float> image;
+    double baselineExposureEV;  // EV shift for correct default rendering
+    int numImages;              // number of merged exposures (for BaselineNoise)
+    double noiseProfile[8] = {};  // 2 doubles per channel (S, O): variance = S*signal + O
+};
+
 class ImageStack {
 public:
     ImageStack() : mask(this), width(0), height(0), flip(0) {}
@@ -48,7 +55,11 @@ public:
     void crop();
     void computeResponseFunctions();
     void generateMask();
-    Array2D<float> compose(const RawParameters & md, int featherRadius, float deghostSigma = 0.0f) const;
+    void correctHotPixels(const RawParameters & params, float sigma);
+    ComposeResult compose(const RawParameters & md, int featherRadius,
+                           float deghostSigma = 0.0f,
+                           double clipPercentile = 99.9,
+                           bool subPixelAlign = false) const;
 
     size_t size() const { return images.size(); }
 
@@ -109,6 +120,7 @@ private:
     size_t height;
     int flip;
     uint16_t satThreshold;
+    uint16_t satThresholdPerChannel[4];
 };
 
 } // namespace hdrmerge

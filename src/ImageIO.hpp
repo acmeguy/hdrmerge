@@ -23,6 +23,7 @@
 #ifndef _IMAGEIO_H_
 #define _IMAGEIO_H_
 
+#include <cmath>
 #include <vector>
 #include <QImage>
 #include <QDateTime>
@@ -57,11 +58,15 @@ public:
 
     struct QDateInterval {
         QDateTime start, end;
+        double ev = 0.0;
         bool operator<(const QDateInterval & r) const {
             return start < r.start;
         }
         double difference(const QDateInterval & r) const {
             return end.msecsTo(r.start) / 1000.0;
+        }
+        int evThird() const {
+            return (int)std::round(ev * 3.0);
         }
     };
     static QDateInterval getImageCreationInterval(const QString & fileName);

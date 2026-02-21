@@ -20,27 +20,18 @@
  *
  */
 
-#ifndef _EXIFTRANSFER_HPP_
-#define _EXIFTRANSFER_HPP_
+#ifndef _ADAPTIVECURVES_HPP_
+#define _ADAPTIVECURVES_HPP_
 
-#include <vector>
-#include <utility>
+#include <QImage>
 #include <QString>
+#include "ExifTransfer.hpp"
 
 namespace hdrmerge {
 
-    struct AdaptiveCurves {
-        bool valid = false;
-        std::vector<std::pair<int,int>> red, green, blue;
-    };
+AdaptiveCurves predictAdaptiveCurves(const QImage & preview, const QString & modelPath);
+QString findOnnxModel();
 
-    namespace Exif {
-        void transferFile(const QString & srcFile, const QString & tmpFile,
-                 const QString & dstFile,
-                 const QString & acrProfilePath,
-                 const AdaptiveCurves & curves);
-    }
+} // namespace hdrmerge
 
-}
-
-#endif // _EXIFTRANSFER_HPP_
+#endif // _ADAPTIVECURVES_HPP_
