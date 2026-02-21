@@ -33,8 +33,10 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#ifdef __SSE2__
+#if defined(__SSE2__)
     #include <x86intrin.h>
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    #include <arm_neon.h>
 #endif
 
 #include "config.h"
@@ -471,12 +473,7 @@ inline void DNG_FloatToFP24(uint32_t input, uint8_t *output) {
 static void compressFloats(Bytef * dst, int tileWidth, int bytesps) {
     if (bytesps == 2) {
         uint16_t * dst16 = (uint16_t *) dst;
-#ifndef __F16C__
-        uint32_t * dst32 = (uint32_t *) dst;
-        for (int i = 0; i < tileWidth; ++i) {
-            dst16[i] = DNG_FloatToHalf(dst32[i]);
-        }
-#else
+#if defined(__F16C__)
         float * dst32 = (float *) dst;
         int i = 0;
         for (; i < tileWidth - 7; i += 8) {
@@ -494,7 +491,27 @@ static void compressFloats(Bytef * dst, int tileWidth, int bytesps) {
         for (; i < tileWidth; ++i) {
             dst16[i] = _cvtss_sh(dst32[i], 0);
         }
-
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float * dst32 = (float *) dst;
+        int i = 0;
+        for (; i < tileWidth - 7; i += 8) {
+            float32x4_t v1 = vld1q_f32(&dst32[i]);
+            float32x4_t v2 = vld1q_f32(&dst32[i + 4]);
+            vst1_u16(&dst16[i], vreinterpret_u16_f16(vcvt_f16_f32(v1)));
+            vst1_u16(&dst16[i + 4], vreinterpret_u16_f16(vcvt_f16_f32(v2)));
+        }
+        for (; i < tileWidth - 3; i += 4) {
+            float32x4_t v1 = vld1q_f32(&dst32[i]);
+            vst1_u16(&dst16[i], vreinterpret_u16_f16(vcvt_f16_f32(v1)));
+        }
+        for (; i < tileWidth; ++i) {
+            dst16[i] = DNG_FloatToHalf(*(uint32_t*)&dst32[i]);
+        }
+#else
+        uint32_t * dst32 = (uint32_t *) dst;
+        for (int i = 0; i < tileWidth; ++i) {
+            dst16[i] = DNG_FloatToHalf(dst32[i]);
+        }
 #endif
     } else if (bytesps == 3) {
         uint8_t  * dst8  = (uint8_t *)  dst;
