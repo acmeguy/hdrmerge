@@ -680,7 +680,8 @@ void ImageStack::correctHotPixels(const RawParameters & params, float sigma) {
 // For each channel c: variance = S[c] * signal + O[c], with signal normalized to [0,1].
 // S = shot noise coefficient (Poisson), O = read noise (estimated from masked pixels).
 // Both scaled by 1/numImages for the merged result.
-static void estimateNoiseProfile(const Image & brightest, const RawParameters & params,
+static void estimateNoiseProfile(const std::vector<Image> & images,
+                                  const RawParameters & params,
                                   int numImages, double noiseProfile[8]) {
     double range = static_cast<double>(params.max);
     if (range <= 0.0) return;
@@ -691,38 +692,39 @@ static void estimateNoiseProfile(const Image & brightest, const RawParameters & 
         if (channelRange <= 0.0) channelRange = range;
         double S = 1.0 / channelRange;
 
-        // Read noise: estimate from masked/black pixel regions (top and left margins)
+        // Read noise: estimate from masked/black pixel regions across all exposures
         double sumSq = 0.0;
         double sum = 0.0;
         size_t count = 0;
 
-        // Top margin pixels
-        for (size_t y = 0; y < params.topMargin && y < brightest.getHeight(); ++y) {
-            for (size_t x = 0; x < brightest.getWidth(); ++x) {
-                if (params.FC(x, y) == c && brightest.contains(x, y)) {
-                    double v = static_cast<double>(brightest(x, y)) - params.cblack[c];
-                    sum += v;
-                    sumSq += v * v;
-                    ++count;
+        for (const auto & img : images) {
+            // Top margin pixels
+            for (size_t y = 0; y < params.topMargin && y < img.getHeight(); ++y) {
+                for (size_t x = 0; x < img.getWidth(); ++x) {
+                    if (params.FC(x, y) == c && img.contains(x, y)) {
+                        double v = static_cast<double>(img(x, y)) - params.cblack[c];
+                        sum += v;
+                        sumSq += v * v;
+                        ++count;
+                    }
                 }
             }
-        }
-        // Left margin pixels (below top margin to avoid double-counting)
-        for (size_t y = params.topMargin; y < brightest.getHeight(); ++y) {
-            for (size_t x = 0; x < params.leftMargin && x < brightest.getWidth(); ++x) {
-                if (params.FC(x, y) == c && brightest.contains(x, y)) {
-                    double v = static_cast<double>(brightest(x, y)) - params.cblack[c];
-                    sum += v;
-                    sumSq += v * v;
-                    ++count;
+            // Left margin pixels (below top margin to avoid double-counting)
+            for (size_t y = params.topMargin; y < img.getHeight(); ++y) {
+                for (size_t x = 0; x < params.leftMargin && x < img.getWidth(); ++x) {
+                    if (params.FC(x, y) == c && img.contains(x, y)) {
+                        double v = static_cast<double>(img(x, y)) - params.cblack[c];
+                        sum += v;
+                        sumSq += v * v;
+                        ++count;
+                    }
                 }
             }
         }
 
         double O;
-        if (count >= 100) {
-            double mean = sum / count;
-            O = (sumSq / count - mean * mean) / (channelRange * channelRange);
+        if (count > 1) {
+            O = (sumSq - sum * sum / count) / (count - 1) / (channelRange * channelRange);
         } else {
             O = 1e-6; // Conservative fallback
         }
@@ -737,12 +739,12 @@ static void estimateNoiseProfile(const Image & brightest, const RawParameters & 
 // CFA-aware bilinear interpolation: read a pixel with fractional offset,
 // interpolating only from same-color neighbors on the CFA grid.
 // For Bayer, same-color neighbors are at distance 2; for X-Trans, distance 6.
-static inline uint16_t interpolateCFA(const Image & img, int x, int y,
-                                       double fdx, double fdy,
-                                       int step, size_t width, size_t height) {
+static inline double interpolateCFA(const Image & img, int x, int y,
+                                     double fdx, double fdy,
+                                     int step, size_t width, size_t height) {
     // Skip if fractional offset is negligible
     if (std::abs(fdx) < 0.1 && std::abs(fdy) < 0.1)
-        return img(x, y);
+        return static_cast<double>(img(x, y));
 
     // Same-color neighbor positions (distance = step)
     int x0 = x, y0 = y;
@@ -768,7 +770,7 @@ static inline uint16_t interpolateCFA(const Image & img, int x, int y,
                   + v01 * (1.0 - wx) * wy
                   + v11 * wx * wy;
 
-    return static_cast<uint16_t>(std::max(0.0, std::min(65535.0, std::round(result))));
+    return result;
 }
 
 
@@ -827,12 +829,71 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         Log::debug("Ghost detection enabled: sigma=", deghostSigma);
     }
 
+    // Pre-compute spatial ghost confidence map for coherent deghosting
+    Array2D<float> ghostMap;
+    if (deghost) {
+        ghostMap = Array2D<float>(width, height);
+        #pragma omp parallel for schedule(dynamic,16)
+        for (size_t y = 0; y < height; ++y) {
+            std::vector<double> tmpRad(numImages), tmpDev(numImages), tmpSort(numImages);
+            for (size_t x = 0; x < width; ++x) {
+                int ch = params.FC(x, y);
+                int nv = 0;
+                for (int k = 0; k <= imageMax; k++) {
+                    if (!images[k].contains(x, y)) continue;
+                    uint16_t raw = images[k](x, y);
+                    if (raw < 1 || raw >= satThreshPerCh[ch]) continue;
+                    tmpRad[nv++] = images[k].exposureAt(x, y);
+                }
+                if (nv < 3) { ghostMap(x, y) = 0.0f; continue; }
+
+                // MAD-based ghost confidence
+                tmpSort.assign(tmpRad.begin(), tmpRad.begin() + nv);
+                std::nth_element(tmpSort.begin(), tmpSort.begin() + nv/2, tmpSort.end());
+                double median = tmpSort[nv/2];
+                for (int i = 0; i < nv; i++)
+                    tmpDev[i] = std::abs(tmpRad[i] - median);
+                std::nth_element(tmpDev.begin(), tmpDev.begin() + nv/2, tmpDev.begin() + nv);
+                double mad = tmpDev[nv/2] * 1.4826;
+
+                double maxDev = *std::max_element(tmpDev.begin(), tmpDev.begin() + nv);
+                float confidence = (mad > 0.0) ? static_cast<float>(maxDev / (deghostSigma * mad)) : 0.0f;
+                ghostMap(x, y) = std::min(confidence, 1.0f);
+            }
+        }
+
+        // Spatial filter: separable 3x3 box blur for ghost map coherence
+        Array2D<float> tmpMap(width, height);
+        #pragma omp parallel for
+        for (size_t y = 0; y < height; ++y) {
+            for (size_t x = 0; x < width; ++x) {
+                float sum = ghostMap(x, y);
+                int count = 1;
+                if (x > 0) { sum += ghostMap(x-1, y); count++; }
+                if (x + 1 < width) { sum += ghostMap(x+1, y); count++; }
+                tmpMap(x, y) = sum / count;
+            }
+        }
+        #pragma omp parallel for
+        for (size_t y = 0; y < height; ++y) {
+            for (size_t x = 0; x < width; ++x) {
+                float sum = tmpMap(x, y);
+                int count = 1;
+                if (y > 0) { sum += tmpMap(x, y-1); count++; }
+                if (y + 1 < height) { sum += tmpMap(x, y+1); count++; }
+                ghostMap(x, y) = sum / count;
+            }
+        }
+        Log::debug("Ghost map computed with spatial coherence filter");
+    }
+
     float maxVal = 0.0;
     #pragma omp parallel for schedule(dynamic,16) reduction(max:maxVal)
     for (size_t y = 0; y < height; ++y) {
         std::vector<double> radiances(numImages);
         std::vector<double> weights(numImages);
         std::vector<double> absDevs(numImages);
+        std::vector<double> sorted(numImages);
 
         for (size_t x = 0; x < width; ++x) {
             int numValid = 0;
@@ -842,13 +903,13 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
             for (int k = 0; k <= imageMax; k++) {
                 if (!images[k].contains(x, y)) continue;
 
-                uint16_t raw;
+                double raw;
                 if (subPixelAlign && (images[k].getFracDx() != 0.0 || images[k].getFracDy() != 0.0)) {
                     raw = interpolateCFA(images[k], x, y,
                                          images[k].getFracDx(), images[k].getFracDy(),
                                          cfaStep, width, height);
                 } else {
-                    raw = images[k](x, y);
+                    raw = static_cast<double>(images[k](x, y));
                 }
 
                 if (raw < 1) continue;
@@ -879,11 +940,14 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                 numValid++;
             }
 
-            // Sigma-clipping ghost detection: reject outlier exposures
-            // using MAD (median absolute deviation) before weighted merge
-            if (deghost && numValid >= 3) {
+            // Spatially coherent ghost detection: use pre-computed ghost map to
+            // modulate per-pixel deghosting strength, preventing salt-and-pepper
+            // artifacts at ghost boundaries
+            if (deghost && numValid >= 3 && ghostMap(x, y) > 0.1f) {
+                double ghostStrength = static_cast<double>(ghostMap(x, y));
+
                 // Find median radiance (partial sort)
-                std::vector<double> sorted(radiances.begin(), radiances.begin() + numValid);
+                sorted.assign(radiances.begin(), radiances.begin() + numValid);
                 std::nth_element(sorted.begin(), sorted.begin() + numValid / 2, sorted.end());
                 double median = sorted[numValid / 2];
 
@@ -893,14 +957,16 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                 std::nth_element(absDevs.begin(), absDevs.begin() + numValid / 2, absDevs.begin() + numValid);
                 double mad = absDevs[numValid / 2] * 1.4826; // MAD to sigma
 
-                // Soft Gaussian deghosting: smoothly downweight outliers instead of
-                // hard rejection, producing smoother ghost boundaries (Khan et al. 2006)
+                // Soft Gaussian deghosting modulated by spatial ghost confidence.
+                // ghostStrength=1.0: full deghosting (original behavior).
+                // ghostStrength=0.0: no deghosting. Smooth spatial transitions.
                 if (mad > 0.0) {
                     double threshold = deghostSigma * mad;
                     double invThreshSq = 1.0 / (threshold * threshold);
                     for (int i = 0; i < numValid; i++) {
                         double dev = std::abs(radiances[i] - median);
-                        weights[i] *= std::exp(-0.5 * dev * dev * invThreshSq);
+                        double gaussFactor = std::exp(-0.5 * dev * dev * invThreshSq);
+                        weights[i] *= (1.0 - ghostStrength) + ghostStrength * gaussFactor;
                     }
                 }
             }
@@ -1066,7 +1132,7 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
     result.numImages = numImages;
 
     // Estimate noise profile from brightest exposure's masked regions
-    estimateNoiseProfile(images.front(), params, numImages, result.noiseProfile);
+    estimateNoiseProfile(images, params, numImages, result.noiseProfile);
     Log::debug("NoiseProfile: S0=", result.noiseProfile[0], " O0=", result.noiseProfile[1],
                " S1=", result.noiseProfile[2], " O1=", result.noiseProfile[3]);
 
