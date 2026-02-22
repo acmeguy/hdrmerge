@@ -959,7 +959,11 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                 double w;
                 if (raw < shadowThresh[ch] + shadowBlendRange[ch]) {
                     // Variance weight: w = 1 / (relExp^2 * (a*raw + b))
+                    // Floor pixelVar at the read noise term to prevent weight
+                    // explosion when raw is near zero in short exposures.
                     double pixelVar = noiseA[ch] * raw + noiseB[ch];
+                    if (pixelVar < noiseB[ch]) pixelVar = noiseB[ch];
+                    if (pixelVar < 1.0) pixelVar = 1.0;
                     double variance = relExp[k] * relExp[k] * pixelVar;
                     double varWeight = 1.0 / variance;
 
