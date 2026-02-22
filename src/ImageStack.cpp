@@ -829,6 +829,42 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         Log::debug("Ghost detection enabled: sigma=", deghostSigma);
     }
 
+    // Estimate noise profile before compose for variance-based shadow weighting
+    double noiseProfile[8] = {};
+    estimateNoiseProfile(images, params, numImages, noiseProfile);
+
+    // Pre-compute per-channel affine noise model coefficients (unscaled, per-exposure)
+    // Sensor model: Var(Z) = a * Z + b, where Z is the raw ADU value
+    double noiseA[4], noiseB[4];
+    for (int c = 0; c < params.colors; ++c) {
+        double channelRange = static_cast<double>(params.max) - params.cblack[c];
+        if (channelRange <= 0.0) channelRange = static_cast<double>(params.max);
+        noiseA[c] = noiseProfile[c * 2] * numImages * channelRange;
+        noiseB[c] = noiseProfile[c * 2 + 1] * numImages * channelRange * channelRange;
+    }
+
+    // Shadow transition point: below this raw level, read noise dominates shot noise
+    // and variance-based weighting improves SNR. Above it, Poisson weights are optimal.
+    // Crossover is where shot noise = read noise: a * raw = b, so raw = b/a
+    double shadowThresh[4], shadowBlendRange[4];
+    for (int c = 0; c < 4; ++c) {
+        if (noiseA[c] > 0.0) {
+            shadowThresh[c] = noiseB[c] / noiseA[c];
+            // Blend over 2x the crossover range for smooth transition
+            shadowBlendRange[c] = shadowThresh[c];
+            if (shadowBlendRange[c] < 1.0) shadowBlendRange[c] = 1.0;
+        } else {
+            shadowThresh[c] = 0.0;
+            shadowBlendRange[c] = 1.0;
+        }
+    }
+
+    // Pre-compute per-exposure relativeExposure for variance computation
+    std::vector<double> relExp(numImages);
+    for (int k = 0; k < numImages; k++) {
+        relExp[k] = images[k].getRelativeExposure();
+    }
+
     // Pre-compute spatial ghost confidence map for coherent deghosting
     Array2D<float> ghostMap;
     if (deghost) {
@@ -915,7 +951,28 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                 if (raw < 1) continue;
                 if (raw >= satThreshPerCh[ch]) continue;
 
-                double w = baseWeight[k];
+                // Blend between Poisson weight (1/relExp) and variance weight
+                // (1/Var(radiance)) based on signal level. In shadows where read
+                // noise dominates, variance weighting properly accounts for the
+                // constant noise floor. In mid-tones/highlights, Poisson weight
+                // is optimal and avoids response function edge cases.
+                double w;
+                if (raw < shadowThresh[ch] + shadowBlendRange[ch]) {
+                    // Variance weight: w = 1 / (relExp^2 * (a*raw + b))
+                    double pixelVar = noiseA[ch] * raw + noiseB[ch];
+                    double variance = relExp[k] * relExp[k] * pixelVar;
+                    double varWeight = 1.0 / variance;
+
+                    if (raw <= shadowThresh[ch]) {
+                        w = varWeight;
+                    } else {
+                        // Smooth blend from variance to Poisson weight
+                        double t = (raw - shadowThresh[ch]) / shadowBlendRange[ch];
+                        w = varWeight * (1.0 - t) + baseWeight[k] * t;
+                    }
+                } else {
+                    w = baseWeight[k];
+                }
                 if (useBlockRolloff) {
                     if (raw >= blockThresh) {
                         w = 0.0;
@@ -1131,8 +1188,8 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
     result.baselineExposureEV = baselineExposureEV;
     result.numImages = numImages;
 
-    // Estimate noise profile from brightest exposure's masked regions
-    estimateNoiseProfile(images, params, numImages, result.noiseProfile);
+    // Copy noise profile (already estimated before compose loop)
+    std::copy(noiseProfile, noiseProfile + 8, result.noiseProfile);
     Log::debug("NoiseProfile: S0=", result.noiseProfile[0], " O0=", result.noiseProfile[1],
                " S1=", result.noiseProfile[2], " O1=", result.noiseProfile[3]);
 
