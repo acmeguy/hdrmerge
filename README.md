@@ -1,10 +1,10 @@
 # HDRMerge
 
-HDRMerge combines two or more raw images into a single raw with an extended dynamic range. It can import any raw image supported by LibRaw, and outputs a DNG 1.4 image with floating point data. The output raw is built from the less noisy pixels of the input, so that shadows maintain as much detail as possible. This tool also offers a GUI to remove ghosts from the resulting image.
+HDRMerge combines two or more raw images into a single raw with an extended dynamic range. It can import any raw image supported by LibRaw, and outputs a DNG 1.4 image with floating point data. The output raw is built using Poisson-optimal weighted merging across exposures, so that shadows maintain as much detail as possible with minimal noise. This tool also offers automatic ghost detection and a GUI to manually refine the resulting image.
 
 ## Download & Installation
 
-Find the latest builds on our [releases page](https://github.com/jcelaya/hdrmerge/releases).
+Find the latest builds on our [releases page](https://github.com/acmeguy/hdrmerge/releases).
 
 Linux users can get HDRMerge from their package manager. If your package manager does not ship the latest version of HDRMerge, file a bug report using your distribution's bug tracker asking them to ship the latest version.
 
@@ -18,15 +18,15 @@ If you would like to compile HDRMerge yourself, follow the instructions in the `
 
 ## Usage
 
-Source images can be loaded from the Open option in the File menu, or passed as arguments in the command line. They must be made with the same camera. After loading them, HDRMerge will correct small misalignments by translation. So, if your camera allows it, you can take the shots with bracketing in burst mode. I have successfully done this just holding the camera with my hands, but using a tripod is highly recommended to obtain the best results.
+Source images can be loaded from the Open option in the File menu, or passed as arguments in the command line. They must be made with the same camera. After loading them, HDRMerge will correct misalignments. With OpenCV available, it uses feature-based alignment (AKAZE/ORB) supporting translation, rotation, scale, and perspective correction. Without OpenCV, it falls back to median threshold bitmap (MTB) translation alignment. So, if your camera allows it, you can take the shots with bracketing in burst mode. A tripod is recommended for best results, but handheld shooting works well with feature-based alignment.
 
 Once the input images are loaded, the interface presents you with a 100% preview of the result. The selected pixels from each input image are painted with a different color. You can then pan the result to inspect it.
 
-When some objects were moving while you took the shots, there will appear "ghosts". You can use the toolbar to add or remove pixels from each image but the last one, until all the pixels that belong to a moving object only come from one of the input images. Usually, you will want to only remove pixels, starting with the first layer and then going down. Adding pixels to the first layers may result in burned areas appearing in the result image, so be careful. On the other hand, the pixels of the first layers contain less noise in the shadows. These operations can be undone and redone with the actions of the Edit menu.
+When some objects were moving while you took the shots, there will appear "ghosts". In CLI mode, automatic ghost detection is available via `--deghost` (sigma-clipping or gradient mode). In the GUI, you can use the toolbar to add or remove pixels from each image but the last one, until all the pixels that belong to a moving object only come from one of the input images. Usually, you will want to only remove pixels, starting with the first layer and then going down. These operations can be undone and redone with the actions of the Edit menu.
 
-Once the preview is satisfactory, the Save HDR option of the File menu generates the output DNG file. You can select the number of bits per sample (16, 24 or 32), the size of the embedded preview (full, half or no preview) and whether to save an image with the mask that was used to merge the input files. The number of bits per sample has an important impact in the output file size. As a rule of thumb, the default value of 16 bits will be enough most of the time. Empirical tests (thanks to DrSlony) show no apparent difference between 16- and 32-bit images, after merging 5 exposures with 2EV steps, despite strong manipulation of shadows/mid-tones/highlights. Nevertheless, if you see some unexpected quantization noise in the output image, you can try a 24-bit output. 32 bits will almost never be necessary, but it can be selected anyway.
+Once the preview is satisfactory, the Save HDR option of the File menu generates the output DNG file. You can select the number of bits per sample (16, 24 or 32), the size of the embedded preview (full, half or no preview) and whether to save an image with the mask that was used to merge the input files. The default is 32 bits per sample, which preserves full 14-bit sensor data. 16 bits is sufficient for most workflows and produces smaller files. 24 bits is a middle ground if you notice quantization noise with 16-bit output.
 
-The program can also be run without GUI, in batch mode. This is accomplished either by providing an output file name with the "-o" switch, or by generating an automatic one with the "-a" switch. Other switches control the output parameters, refer to the output of the "--help" switch. macOS users may need to change their current working directory to the one which contains the executable in order to run it in CLI mode.
+The program can also be run without GUI, in batch mode. This is accomplished either by providing an output file name with the "-o" switch, or by generating an automatic one with the "-a" switch. Entire directories can be scanned with `-d DIR`. Multiple merge jobs can run concurrently with `-j N`. Other switches control the output parameters, refer to the output of the "--help" switch.
 
 HDRMerge merges raw files to produce an HDR image in DNG format. Once you have obtained your image from HDRMerge, you need to further process it in an application that supports HDR images in the DNG format, such as [RawTherapee](https://rawtherapee.com) or [darktable](https://darktable.org). 
 
@@ -38,15 +38,28 @@ See the file `LICENSE`.
 ## Contributing
 
 Fork the project and send pull requests, or send patches by creating a new issue on our GitHub page:
-https://github.com/jcelaya/hdrmerge/issues
+https://github.com/acmeguy/hdrmerge/issues
 
 ## Reporting Bugs
 
 Report bugs by creating a new issue on our GitHub page:
-https://github.com/jcelaya/hdrmerge/issues
+https://github.com/acmeguy/hdrmerge/issues
 
 ## Changelog:
 
+- acmeguy fork (2026)
+  - **Concurrency**: Concurrent batch processing (`-j N`) for merging multiple HDR sets in parallel. Thread-safe logging via mutex. OpenMP `reduction` clause replaces manual critical sections in ImageStack.
+  - **Merge algorithm**: Replaced binary pixel selection with Poisson-optimal weighted merge for cleaner HDR compositing. Noise-model-aware shadow weighting with safe Poisson/variance blend. Multi-exposure noise estimation. Double-precision CFA interpolation.
+  - **Ghost detection**: Sigma-clipping ghost detection with soft deghosting, Bayer-block rolloff, spatial ghost coherence, and configurable deghost modes (sigma/gradient) and iteration control.
+  - **Alignment**: Feature-based alignment using OpenCV (AKAZE/ORB with progressive 4/6/8 DOF geometry estimation and MTB fallback). Sub-pixel alignment residual diagnostic.
+  - **Response function**: Linear response model with R-squared diagnostic, replacing spline-only path. Nonlinear spline fitting available as opt-in (`--response-mode nonlinear`).
+  - **DNG writer**: Streaming tile-based DNG writer to reduce peak memory usage. Refactored ExifTransfer with file-based `transferFile()`. Dual-illuminant passthrough. AsShotNeutral metadata.
+  - **Compression**: libdeflate for DNG tile compression. zlib-ng with NEON-optimized DEFLATE. JXL compression support. Configurable compression level (`-c 1..12`).
+  - **ARM NEON**: Vectorized fattenMask, boxBlurT, and float-to-half conversion for Apple Silicon.
+  - **CLI**: Directory scanning (`-d DIR`) with auto-detection of directory arguments. Wall-clock timing output. Hot pixel correction (`--hot-pixel-sigma`). Resizer options. ACR profile embedding. Adaptive curves (with optional ONNX Runtime). Default bps changed from 16 to 32 to preserve full 14-bit sensor data.
+  - **Internals**: Replaced 256-entry popcount LUT with `__builtin_popcount()`. `-march=native` for Release builds.
+  - **Bug fixes**: Fixed black/pink dot artifacts from unbounded variance weight in shadow merge. Deghost allocation fix.
+  - **Build**: Requires C++11, Qt5, LibRaw >= 0.21, zlib-ng, libdeflate. Optional: OpenCV, libjxl, ONNX Runtime, ALGLIB.
 - v0.6 (not released yet)
   - Allow user to specify custom white level in case of artifacts with automatically computed white level from LibRaw.
   - Added support for raw files from Fufjifilm X-Trans sensors.
@@ -121,6 +134,6 @@ There is also a community forum for discussions and connecting with other users 
 
 ## Links
 
-Website and documentation: http://jcelaya.github.io/hdrmerge/
+Upstream: https://github.com/jcelaya/hdrmerge
+This fork: https://github.com/acmeguy/hdrmerge
 Forum: https://discuss.pixls.us/c/software/hdrmerge
-GitHub: https://github.com/jcelaya/hdrmerge
