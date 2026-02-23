@@ -28,6 +28,9 @@
 
 namespace hdrmerge {
 
+enum class ResponseMode { Linear, Nonlinear };
+enum class DeghostMode { Legacy, Robust };
+
 struct LoadOptions {
     std::vector<QString> fileNames;
     bool align;
@@ -38,8 +41,10 @@ struct LoadOptions {
     double batchGap;
     bool withSingles;
     bool alignFeatures;
+    float hotPixelSigma;
+    ResponseMode responseMode;
     LoadOptions() : align(true), crop(true), useCustomWl(false), customWl(16383), batch(false), batchGap(2.0),
-        withSingles(false), alignFeatures(false) {}
+        withSingles(false), alignFeatures(false), hotPixelSigma(0.0f), responseMode(ResponseMode::Linear) {}
 };
 
 
@@ -53,16 +58,18 @@ struct SaveOptions {
     int featherRadius;
     int compressionLevel;
     float deghostSigma;
+    DeghostMode deghostMode;
+    int deghostIterations;
     double clipPercentile;
     QString acrProfilePath;
     double evShift;
-    float hotPixelSigma;
     bool autoCurves;
     int resizeLong;
     bool subPixelAlign;
     SaveOptions() : bps(24), previewSize(0), saveMask(false), featherRadius(3),
-        compressionLevel(6), deghostSigma(0.0f), clipPercentile(99.9),
-        evShift(0.0), hotPixelSigma(0.0f),
+        compressionLevel(6), deghostSigma(0.0f), deghostMode(DeghostMode::Robust),
+        deghostIterations(1), clipPercentile(99.9),
+        evShift(0.0),
         autoCurves(false), resizeLong(0), subPixelAlign(false) {}
 };
 

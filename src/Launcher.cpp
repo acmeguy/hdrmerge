@@ -187,6 +187,7 @@ int Launcher::automaticMerge() {
                 Log::progress(tr("Skipping single image %1").arg(options.fileNames.front()));
                 continue;
             }
+            auto setStart = std::chrono::steady_clock::now();
             CoutProgressIndicator progress;
             int numImages = options.fileNames.size();
             int loadResult = io.load(options, progress);
@@ -214,9 +215,11 @@ int Launcher::automaticMerge() {
             setOptions.fileName = applyOutputDir(setOptions.fileName, setOptions.outputDir);
             Log::progress(tr("Writing result to %1").arg(setOptions.fileName));
             io.save(setOptions, progress);
+            double setElapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - setStart).count();
+            Log::msg(Log::INFO, setOptions.fileName, "  ", setElapsed, "s");
         }
         double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
-        Log::progress("Total processing time: ", elapsed, " seconds");
+        Log::msg(Log::INFO, "Total processing time: ", elapsed, " seconds");
         return result;
     }
 
@@ -260,6 +263,7 @@ int Launcher::automaticMerge() {
 #ifdef _OPENMP
             omp_set_num_threads(ompPerJob);
 #endif
+            auto setStart = std::chrono::steady_clock::now();
             ImageIO io;
             CoutProgressIndicator progress;
             int numImages = threadOptions.fileNames.size();
@@ -287,6 +291,8 @@ int Launcher::automaticMerge() {
                 setOptions.fileName = applyOutputDir(setOptions.fileName, setOptions.outputDir);
                 Log::progress(tr("Writing result to %1").arg(setOptions.fileName));
                 io.save(setOptions, progress);
+                double setElapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - setStart).count();
+                Log::msg(Log::INFO, setOptions.fileName, "  ", setElapsed, "s");
             }
 
             activeJobs--;
@@ -299,7 +305,7 @@ int Launcher::automaticMerge() {
     }
 
     double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
-    Log::progress("Total processing time: ", elapsed, " seconds");
+    Log::msg(Log::INFO, "Total processing time: ", elapsed, " seconds");
     return globalResult.load();
 }
 
@@ -403,6 +409,26 @@ void Launcher::parseCommandLine() {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
             }
+        } else if (string("--deghost-mode") == argv[i]) {
+            if (++i < argc) {
+                string mode(argv[i]);
+                if (mode == "legacy") {
+                    saveOptions.deghostMode = DeghostMode::Legacy;
+                } else if (mode == "robust") {
+                    saveOptions.deghostMode = DeghostMode::Robust;
+                } else {
+                    cerr << tr("Invalid --deghost-mode, must be 'legacy' or 'robust'.") << endl;
+                }
+            }
+        } else if (string("--deghost-iterations") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    int val = stoi(argv[i]);
+                    saveOptions.deghostIterations = std::max(1, std::min(5, val));
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
         } else if (string("--clip-percentile") == argv[i]) {
             if (++i < argc) {
                 try {
@@ -439,10 +465,21 @@ void Launcher::parseCommandLine() {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
             }
+        } else if (string("--response-mode") == argv[i]) {
+            if (++i < argc) {
+                string mode(argv[i]);
+                if (mode == "linear") {
+                    generalOptions.responseMode = ResponseMode::Linear;
+                } else if (mode == "nonlinear") {
+                    generalOptions.responseMode = ResponseMode::Nonlinear;
+                } else {
+                    cerr << tr("Invalid --response-mode, must be 'linear' or 'nonlinear'.") << endl;
+                }
+            }
         } else if (string("--hot-pixel") == argv[i]) {
             if (++i < argc) {
                 try {
-                    saveOptions.hotPixelSigma = std::max(0.0f, stof(argv[i]));
+                    generalOptions.hotPixelSigma = std::max(0.0f, stof(argv[i]));
                 } catch (std::invalid_argument & e) {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
@@ -486,8 +523,8 @@ void Launcher::parseCommandLine() {
         unsigned int hw = std::thread::hardware_concurrency();
         maxJobs = std::max(1u, hw / 2);
     }
-    // Default to batch mode when files are provided without explicit output
-    if (!generalOptions.fileNames.empty() && saveOptions.fileName.isEmpty()) {
+    // Default to batch mode when files are provided
+    if (!generalOptions.fileNames.empty()) {
         generalOptions.batch = true;
     }
     // Default output directory to "merged" subfolder alongside inputs
@@ -546,6 +583,8 @@ void Launcher::showHelp() {
     cout << "    " << "-w whitelevel " << tr("Use custom white level.") << endl;
     cout << "    " << "-c LEVEL      " << tr("Compression level 1-12. Implies -b 16 (JPEG XL) unless -b is also given.") << endl;
     cout << "    " << "--deghost S   " << tr("Sigma-clipping ghost detection. S is the sigma threshold (e.g. 3.0). 0=off (default).") << endl;
+    cout << "    " << "--deghost-mode MODE " << tr("Deghost algorithm: 'legacy' (MAD) or 'robust' (reference-guided). Default: robust.") << endl;
+    cout << "    " << "--deghost-iterations N " << tr("Refinement iterations for robust deghosting (1-5). Default: 1.") << endl;
     cout << "    " << "--clip-percentile P " << tr("Normalization percentile (90-100). Default 99.9. Use 100 for legacy behavior.") << endl;
     cout << "    " << "-j N          " << tr("Number of concurrent merge jobs in batch mode. Default: half of CPU cores.") << endl;
     cout << "    " << "-L PROFILE    " << tr("Apply ACR/Lightroom .xmp preset to output DNGs. Overrides default_profile.xmp.") << endl;
@@ -553,6 +592,7 @@ void Launcher::showHelp() {
     cout << "    " << "--auto-curves " << tr("Generate per-image adaptive RGB tone curves via ONNX model.") << endl;
     cout << "    " << "--resize-long N " << tr("Resize output so longest edge is N pixels. CFA-aware Lanczos-3.") << endl;
     cout << "    " << "--ev-shift EV " << tr("Add EV stops to default rendering brightness. Does not change pixel data.") << endl;
+    cout << "    " << "--response-mode MODE " << tr("Response curve mode: 'linear' (default) or 'nonlinear'. Linear is optimal for RAW.") << endl;
     cout << "    " << "--hot-pixel S " << tr("Hot/dead pixel correction. S is the sigma threshold (e.g. 3.0). 0=off (default).") << endl;
     cout << "    " << "--sub-pixel   " << tr("Apply sub-pixel alignment correction (experimental). Default off.") << endl;
     cout << "    " << "-O|--output-dir DIR " << tr("Write output files to DIR instead of alongside inputs.") << endl;
@@ -581,6 +621,10 @@ bool Launcher::checkGUI() {
             ++i; // skip the value
         } else if (string("--deghost") == argv[i]) {
             ++i; // skip the value
+        } else if (string("--deghost-mode") == argv[i]) {
+            ++i; // skip the value
+        } else if (string("--deghost-iterations") == argv[i]) {
+            ++i; // skip the value
         } else if (string("--clip-percentile") == argv[i]) {
             ++i; // skip the value
         } else if (string("-j") == argv[i]) {
@@ -592,6 +636,8 @@ bool Launcher::checkGUI() {
         } else if (string("--resize-long") == argv[i]) {
             ++i; // skip the value
         } else if (string("--ev-shift") == argv[i]) {
+            ++i; // skip the value
+        } else if (string("--response-mode") == argv[i]) {
             ++i; // skip the value
         } else if (string("--hot-pixel") == argv[i]) {
             ++i; // skip the value

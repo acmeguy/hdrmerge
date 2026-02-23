@@ -67,6 +67,9 @@ public:
     double exposureForRaw(uint16_t raw) const {
         return response(raw);
     }
+    double exposureForRaw(double raw) const {
+        return response(raw);
+    }
     uint16_t getMaxAround(size_t x, size_t y) const;
     bool isSaturated(uint16_t v) const {
         return v >= satThreshold;
@@ -83,7 +86,7 @@ public:
     void releaseAlignData() {
         scaled.reset();
     }
-    void computeResponseFunction(const Image & nextImage);
+    void computeResponseFunction(const Image & refImage, bool linearOnly = true);
     bool operator<(const Image & r) {
         return brightness > r.brightness;
     }
@@ -103,6 +106,9 @@ private:
         double linear;
         alglib::spline1dinterpolant nonLinear;
         double operator()(uint16_t v) const {
+            return v <= threshold ? v * linear : alglib::spline1dcalc(nonLinear, v);
+        }
+        double operator()(double v) const {
             return v <= threshold ? v * linear : alglib::spline1dcalc(nonLinear, v);
         }
         void setLinear(double slope);
