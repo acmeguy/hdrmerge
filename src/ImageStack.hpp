@@ -53,11 +53,13 @@ public:
     int addImage(Image && i);
     void align(bool useFeatures = false);
     void crop();
-    void computeResponseFunctions();
+    void computeResponseFunctions(bool linearMode = true);
     void generateMask();
     void correctHotPixels(const RawParameters & params, float sigma);
     ComposeResult compose(const RawParameters & md, int featherRadius,
                            float deghostSigma = 0.0f,
+                           DeghostMode deghostMode = DeghostMode::Robust,
+                           int deghostIterations = 1,
                            double clipPercentile = 99.9,
                            bool subPixelAlign = false) const;
 

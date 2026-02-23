@@ -97,7 +97,7 @@ double Image::getRelativeExposure() const {
 }
 
 
-void Image::computeResponseFunction(const Image & r) {
+void Image::computeResponseFunction(const Image & r, bool linearOnly) {
     int reldx = dx - std::max(dx, r.dx);
     int relrdx = r.dx - std::max(dx, r.dx);
     int w = width + reldx + relrdx;
@@ -107,71 +107,99 @@ void Image::computeResponseFunction(const Image & r) {
     uint16_t * usePixels = &data[-reldy*width - reldx];
     const uint16_t * rUsePixels = &r.data[-relrdy*width - relrdx];
 
-    // Get average relative values between this image and the last one
-    std::vector<std::pair<int, double>> histogram(max + 1);
-    for (auto & i : histogram) i = { 0, 0.0 };
-    #pragma omp parallel
-    {
-        // use one histogram per thread
-        std::vector<std::pair<int, double>> histogramThr(max + 1);
-        for (auto & i : histogramThr) i = { 0, 0.0 };
-        #pragma omp for nowait
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                int pos = y * width + x;
-                uint16_t v = usePixels[pos];
-                uint16_t nv = rUsePixels[pos];
-                if (v >= nv && v < satThreshold) {
-                    histogramThr[v].first++;
-                    histogramThr[v].second += r.response(nv);
-                }
-            }
-        }
-        #pragma omp critical
-        {
-            // join per thread histogram to global one
-            for(int i=0;i<max+1;i++) {
-                histogram[i].first += histogramThr[i].first;
-                histogram[i].second += histogramThr[i].second;
+    // Scalar linear fit across full unsaturated overlap range
+    // Model: r.response(nv) = slope * v
+    // Solution: slope = sum(v * rv) / sum(v^2)
+    double sumVR = 0, sumVV = 0;
+    double sumR = 0, sumRR = 0;
+    long long count = 0;
+    #pragma omp parallel for reduction(+:sumVR,sumVV,sumR,sumRR,count)
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            int pos = y * width + x;
+            uint16_t v = usePixels[pos];
+            uint16_t nv = rUsePixels[pos];
+            if (v > 0 && v < satThreshold && nv > 0 && !r.isSaturated(nv)) {
+                double rv = r.response(nv);
+                double dv = (double)v;
+                sumVR += dv * rv;
+                sumVV += dv * dv;
+                sumR += rv;
+                sumRR += rv * rv;
+                count++;
             }
         }
     }
-    alglib::real_1d_array values, adjValues;
-    values.setlength(max);
-    adjValues.setlength(max);
-    values[0] = 0;
-    adjValues[0] = 0;
-    int i = 1;
-    for (int v = max - 1; v >= max*0.75; --v) {
-        if (histogram[v].first > 2) {
-            values[i] = v;
-            adjValues[i] = histogram[v].second / histogram[v].first;
-            ++i;
-        }
+
+    if (count < 100 || sumVV < 1e-10) {
+        Log::debug("Response: insufficient overlap (", count, " pixels), keeping default");
+        return;
     }
-    if (i >= max/8) {
-        alglib::ae_int_t info;
-        alglib::spline1dfitreport rep;
-        alglib::spline1dfitpenalized(values, adjValues, i, 200, 3, info, response.nonLinear, rep);
-        response.linear = alglib::spline1dcalc(response.nonLinear, response.threshold) / response.threshold;
+
+    double slope = sumVR / sumVV;
+
+    // R^2 diagnostic
+    double meanR = sumR / count;
+    double ssTot = sumRR - count * meanR * meanR;
+    double ssRes = sumRR - 2.0 * slope * sumVR + slope * slope * sumVV;
+    double r2 = (ssTot > 1e-10) ? 1.0 - ssRes / ssTot : 1.0;
+
+    Log::debug("Response: slope=", slope, " R^2=", r2, " (", count, " px)");
+
+    if (linearOnly || r2 >= 0.995) {
+        response.setLinear(slope);
     } else {
-        response.threshold = 65535;
-        // Fallback method for dark images:
-        // Minimize square error between images:
-        // min. C(n) = sum(n*f(x) - g(x))^2  ->  n = sum(f(x)*g(x)) / sum(f(x)^2)
-        double numerator = 0, denom = 0;
-        for (int y = 0; y < h; ++y) {
-            for (int x = 0; x < w; ++x) {
-                int pos = y * width + x;
-                double v = usePixels[pos];
-                double nv = rUsePixels[pos];
-                if (v >= nv && v < satThreshold) {
-                    numerator += v * r.response(nv);
-                    denom += v * v;
+        // Nonlinear spline path (explicit --response-mode nonlinear and R^2 < 0.995)
+        Log::debug("Response: R^2 < 0.995, fitting nonlinear spline");
+        std::vector<std::pair<int, double>> histogram(max + 1);
+        for (auto & i : histogram) i = { 0, 0.0 };
+        #pragma omp parallel
+        {
+            std::vector<std::pair<int, double>> histogramThr(max + 1);
+            for (auto & i : histogramThr) i = { 0, 0.0 };
+            #pragma omp for nowait
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    int pos = y * width + x;
+                    uint16_t v = usePixels[pos];
+                    uint16_t nv = rUsePixels[pos];
+                    if (v > 0 && v < satThreshold && nv > 0 && !r.isSaturated(nv)) {
+                        histogramThr[v].first++;
+                        histogramThr[v].second += r.response(nv);
+                    }
+                }
+            }
+            #pragma omp critical
+            {
+                for(int i=0;i<max+1;i++) {
+                    histogram[i].first += histogramThr[i].first;
+                    histogram[i].second += histogramThr[i].second;
                 }
             }
         }
-        response.linear = numerator / denom;
+        alglib::real_1d_array values, adjValues;
+        values.setlength(max);
+        adjValues.setlength(max);
+        values[0] = 0;
+        adjValues[0] = 0;
+        int i = 1;
+        // Use full unsaturated range (not just top 25%)
+        for (int v = max; v >= 1; --v) {
+            if (histogram[v].first > 2) {
+                values[i] = v;
+                adjValues[i] = histogram[v].second / histogram[v].first;
+                ++i;
+            }
+        }
+        if (i >= max/8) {
+            alglib::ae_int_t info;
+            alglib::spline1dfitreport rep;
+            alglib::spline1dfitpenalized(values, adjValues, i, 200, 3, info, response.nonLinear, rep);
+            response.linear = alglib::spline1dcalc(response.nonLinear, response.threshold) / response.threshold;
+        } else {
+            Log::debug("Response: insufficient data for spline, using linear");
+            response.setLinear(slope);
+        }
     }
 }
 

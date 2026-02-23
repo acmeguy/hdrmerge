@@ -33,6 +33,13 @@
     #include <arm_neon.h>
 #endif
 
+#ifdef HAVE_OPENCV
+    #include <opencv2/core.hpp>
+    #include <opencv2/features2d.hpp>
+    #include <opencv2/calib3d.hpp>
+    #include <opencv2/imgproc.hpp>
+#endif
+
 using namespace std;
 using namespace hdrmerge;
 
@@ -173,20 +180,359 @@ static void measureSubPixelResidual(const Image & ref, const Image & img,
     fracDy = std::max(-0.5, std::min(0.5, fracDy));
 }
 
+#ifdef HAVE_OPENCV
+// Build a grayscale 8-bit preview from raw Bayer data via 2x2 averaging.
+// This avoids the CFA artifact problem when detecting features on raw mosaic data.
+static cv::Mat bayerToGray8(const Image & img) {
+    size_t w = img.getWidth(), h = img.getHeight();
+    size_t gw = w / 2, gh = h / 2;
+    cv::Mat gray(gh, gw, CV_8UC1);
+    for (size_t y = 0; y < gh; ++y) {
+        for (size_t x = 0; x < gw; ++x) {
+            size_t bx = x * 2, by = y * 2;
+            uint32_t sum = (uint32_t)img(bx, by) + img(bx + 1, by)
+                         + img(bx, by + 1) + img(bx + 1, by + 1);
+            // Scale 14-bit average to 8-bit
+            gray.at<uint8_t>(y, x) = (uint8_t)std::min(255u, sum >> 8);
+        }
+    }
+    return gray;
+}
+
+// Attempt feature-based alignment of img against ref. Returns true on success,
+// filling dx, dy (integer) and fdx, fdy (fractional sub-pixel).
+// On failure, returns false and the caller should fall back to MTB.
+static bool featureAlign(const Image & img, const Image & ref,
+                          int & outDx, int & outDy, double & outFdx, double & outFdy) {
+    // Build grayscale previews (half resolution via 2x2 Bayer averaging)
+    cv::Mat grayImg = bayerToGray8(img);
+    cv::Mat grayRef = bayerToGray8(ref);
+
+    // Apply CLAHE to normalize across exposure differences
+    auto clahe = cv::createCLAHE(4.0, cv::Size(8, 8));
+    clahe->apply(grayImg, grayImg);
+    clahe->apply(grayRef, grayRef);
+
+    // Detect features with AKAZE
+    auto akaze = cv::AKAZE::create();
+    std::vector<cv::KeyPoint> kpImg, kpRef;
+    cv::Mat descImg, descRef;
+    akaze->detectAndCompute(grayImg, cv::noArray(), kpImg, descImg);
+    akaze->detectAndCompute(grayRef, cv::noArray(), kpRef, descRef);
+
+    Log::debug("Features: img=", kpImg.size(), " ref=", kpRef.size());
+
+    // ORB fallback if AKAZE finds too few features
+    if (kpImg.size() < 64 || kpRef.size() < 64) {
+        Log::debug("AKAZE insufficient, trying ORB fallback");
+        auto orb = cv::ORB::create(2000);
+        kpImg.clear(); kpRef.clear();
+        orb->detectAndCompute(grayImg, cv::noArray(), kpImg, descImg);
+        orb->detectAndCompute(grayRef, cv::noArray(), kpRef, descRef);
+        Log::debug("ORB features: img=", kpImg.size(), " ref=", kpRef.size());
+    }
+
+    if (kpImg.size() < 16 || kpRef.size() < 16) {
+        Log::debug("Feature alignment: too few keypoints, falling back to MTB");
+        return false;
+    }
+
+    // KNN matching with Lowe ratio test (0.75) + cross-check
+    auto matcher = cv::BFMatcher::create(
+        descImg.type() == CV_8U ? cv::NORM_HAMMING : cv::NORM_L2);
+    std::vector<std::vector<cv::DMatch>> knnMatches;
+    matcher->knnMatch(descImg, descRef, knnMatches, 2);
+
+    // Ratio test
+    std::vector<cv::DMatch> goodMatches;
+    for (auto & m : knnMatches) {
+        if (m.size() >= 2 && m[0].distance < 0.75f * m[1].distance) {
+            goodMatches.push_back(m[0]);
+        }
+    }
+
+    // Reverse match for cross-check
+    std::vector<std::vector<cv::DMatch>> knnReverse;
+    matcher->knnMatch(descRef, descImg, knnReverse, 2);
+    std::vector<int> reverseMap(kpRef.size(), -1);
+    for (auto & m : knnReverse) {
+        if (m.size() >= 2 && m[0].distance < 0.75f * m[1].distance) {
+            reverseMap[m[0].queryIdx] = m[0].trainIdx;
+        }
+    }
+
+    // Keep only mutual nearest neighbors
+    std::vector<cv::DMatch> mutualMatches;
+    for (auto & m : goodMatches) {
+        if (reverseMap[m.trainIdx] == m.queryIdx) {
+            mutualMatches.push_back(m);
+        }
+    }
+
+    Log::debug("Matches: ratio-test=", goodMatches.size(),
+               " mutual=", mutualMatches.size());
+
+    if (mutualMatches.size() < 16) {
+        Log::debug("Feature alignment: too few matches (", mutualMatches.size(),
+                 "), falling back to MTB");
+        return false;
+    }
+
+    // Build point arrays (in half-resolution coordinates)
+    std::vector<cv::Point2f> ptsImg, ptsRef;
+    for (auto & m : mutualMatches) {
+        ptsImg.push_back(kpImg[m.queryIdx].pt);
+        ptsRef.push_back(kpRef[m.trainIdx].pt);
+    }
+
+    // Progressive geometry estimation: 4 DOF -> 6 DOF -> 8 DOF
+    // Use MAGSAC++ (USAC_MAGSAC) for robust estimation
+    cv::Mat transform;
+    cv::Mat inliers;
+    double reprErr = 1e9;
+    int modelDOF = 0;
+    std::string modelName;
+
+    // Try 4 DOF (translation + rotation + uniform scale)
+    // Note: estimateAffinePartial2D only supports RANSAC/LMEDS, not USAC_MAGSAC
+    transform = cv::estimateAffinePartial2D(ptsImg, ptsRef, inliers,
+                                             cv::RANSAC, 3.0, 2000, 0.99);
+    if (!transform.empty()) {
+        // Compute reprojection error on inliers
+        double sumErr = 0;
+        int nInliers = 0;
+        for (size_t i = 0; i < ptsImg.size(); ++i) {
+            if (inliers.at<uint8_t>(i)) {
+                double px = transform.at<double>(0, 0) * ptsImg[i].x
+                          + transform.at<double>(0, 1) * ptsImg[i].y
+                          + transform.at<double>(0, 2);
+                double py = transform.at<double>(1, 0) * ptsImg[i].x
+                          + transform.at<double>(1, 1) * ptsImg[i].y
+                          + transform.at<double>(1, 2);
+                double dx = px - ptsRef[i].x;
+                double dy = py - ptsRef[i].y;
+                sumErr += dx * dx + dy * dy;
+                nInliers++;
+            }
+        }
+        reprErr = (nInliers > 0) ? std::sqrt(sumErr / nInliers) : 1e9;
+        modelDOF = 4;
+        modelName = "AffinePartial2D";
+
+        double inlierRatio = (double)nInliers / ptsImg.size();
+        Log::debug("4DOF: reprErr=", reprErr, "px inliers=", nInliers,
+                   " ratio=", inlierRatio);
+
+        // Escalate to 6 DOF if poor fit
+        if (reprErr > 2.0 || inlierRatio < 0.45) {
+            cv::Mat t6 = cv::estimateAffine2D(ptsImg, ptsRef, inliers,
+                                               cv::RANSAC, 3.0, 2000, 0.99);
+            if (!t6.empty()) {
+                double sumErr6 = 0;
+                int nInliers6 = 0;
+                for (size_t i = 0; i < ptsImg.size(); ++i) {
+                    if (inliers.at<uint8_t>(i)) {
+                        double px = t6.at<double>(0, 0) * ptsImg[i].x
+                                  + t6.at<double>(0, 1) * ptsImg[i].y
+                                  + t6.at<double>(0, 2);
+                        double py = t6.at<double>(1, 0) * ptsImg[i].x
+                                  + t6.at<double>(1, 1) * ptsImg[i].y
+                                  + t6.at<double>(1, 2);
+                        double dx = px - ptsRef[i].x;
+                        double dy = py - ptsRef[i].y;
+                        sumErr6 += dx * dx + dy * dy;
+                        nInliers6++;
+                    }
+                }
+                double reprErr6 = (nInliers6 > 0) ? std::sqrt(sumErr6 / nInliers6) : 1e9;
+                Log::debug("6DOF: reprErr=", reprErr6, "px inliers=", nInliers6);
+                if (reprErr6 < reprErr) {
+                    transform = t6;
+                    reprErr = reprErr6;
+                    nInliers = nInliers6;
+                    modelDOF = 6;
+                    modelName = "Affine2D";
+                }
+            }
+
+            // Escalate to 8 DOF if still poor
+            inlierRatio = (double)nInliers / ptsImg.size();
+            if (reprErr > 2.0 || inlierRatio < 0.45) {
+                cv::Mat H = cv::findHomography(ptsImg, ptsRef,
+                                                cv::USAC_MAGSAC, 3.0, inliers, 2000, 0.99);
+                if (!H.empty()) {
+                    double sumErr8 = 0;
+                    int nInliers8 = 0;
+                    for (size_t i = 0; i < ptsImg.size(); ++i) {
+                        if (inliers.at<uint8_t>(i)) {
+                            double w = H.at<double>(2, 0) * ptsImg[i].x
+                                     + H.at<double>(2, 1) * ptsImg[i].y
+                                     + H.at<double>(2, 2);
+                            double px = (H.at<double>(0, 0) * ptsImg[i].x
+                                       + H.at<double>(0, 1) * ptsImg[i].y
+                                       + H.at<double>(0, 2)) / w;
+                            double py = (H.at<double>(1, 0) * ptsImg[i].x
+                                       + H.at<double>(1, 1) * ptsImg[i].y
+                                       + H.at<double>(1, 2)) / w;
+                            double dx = px - ptsRef[i].x;
+                            double dy = py - ptsRef[i].y;
+                            sumErr8 += dx * dx + dy * dy;
+                            nInliers8++;
+                        }
+                    }
+                    double reprErr8 = (nInliers8 > 0) ? std::sqrt(sumErr8 / nInliers8) : 1e9;
+                    Log::debug("8DOF: reprErr=", reprErr8, "px inliers=", nInliers8);
+                    if (reprErr8 < reprErr) {
+                        // Extract affine approximation from homography for dx/dy
+                        transform = cv::Mat(2, 3, CV_64F);
+                        transform.at<double>(0, 0) = H.at<double>(0, 0);
+                        transform.at<double>(0, 1) = H.at<double>(0, 1);
+                        transform.at<double>(0, 2) = H.at<double>(0, 2);
+                        transform.at<double>(1, 0) = H.at<double>(1, 0);
+                        transform.at<double>(1, 1) = H.at<double>(1, 1);
+                        transform.at<double>(1, 2) = H.at<double>(1, 2);
+                        reprErr = reprErr8;
+                        nInliers = nInliers8;
+                        modelDOF = 8;
+                        modelName = "Homography";
+                    }
+                }
+            }
+        }
+
+        // Sanity checks
+        double inlierFinal = (double)nInliers / ptsImg.size();
+        if (nInliers < 16 || inlierFinal < 0.45) {
+            Log::debug("Feature alignment: poor inlier ratio (", inlierFinal,
+                     "), falling back to MTB");
+            return false;
+        }
+
+        // Extract rotation angle from transform matrix for diagnostic
+        double a = transform.at<double>(0, 0);
+        double b = transform.at<double>(0, 1);
+        double rotation_deg = std::atan2(b, a) * 180.0 / M_PI;
+        double scale = std::sqrt(a * a + b * b);
+
+        if (std::abs(rotation_deg) > 2.0) {
+            Log::debug("Feature alignment: rotation ", rotation_deg,
+                     " deg exceeds 2 deg limit");
+        }
+        if (std::abs(scale - 1.0) > 0.02) {
+            Log::debug("Feature alignment: scale ", scale,
+                     " deviates > 2% from unity");
+        }
+
+        // Extract translation in full-resolution coordinates (preview is half-res)
+        double txHalf = transform.at<double>(0, 2);
+        double tyHalf = transform.at<double>(1, 2);
+        double txFull = txHalf * 2.0;
+        double tyFull = tyHalf * 2.0;
+
+        // Split into integer and fractional parts.
+        // CRITICAL: round to nearest EVEN integer to preserve Bayer CFA alignment.
+        // Odd-pixel shifts swap R/B channels, causing pink/green color casts.
+        outDx = (int)std::round(txFull / 2.0) * 2;
+        outDy = (int)std::round(tyFull / 2.0) * 2;
+        outFdx = txFull - outDx;
+        outFdy = tyFull - outDy;
+
+        Log::debug("Feature align: ", modelName, " (", modelDOF, "DOF) reprErr=",
+                 reprErr, "px inliers=", nInliers, "/", ptsImg.size(),
+                 " rot=", rotation_deg, "deg scale=", scale,
+                 " tx=", txFull, " ty=", tyFull);
+        return true;
+    }
+
+    Log::debug("Feature alignment: transform estimation failed, falling back to MTB");
+    return false;
+}
+#endif // HAVE_OPENCV
+
+
 void ImageStack::align(bool useFeatures) {
     if (images.size() > 1) {
 #ifdef HAVE_OPENCV
         if (useFeatures) {
-            Log::progress("Feature-based alignment requested (OpenCV available)");
-            // TODO: Implement AKAZE/ORB feature matching with homography estimation.
-            // For now, fall through to MTB alignment.
-            Log::progress("Feature-based alignment not yet implemented, using MTB");
+            Timer t("Feature Align");
+            Log::debug("Feature-based alignment (AKAZE/ORB + MAGSAC++)");
+
+            // Align each image against its neighbor (pairwise chain, like MTB)
+            // then accumulate. This maximizes feature overlap between exposures.
+            bool allSuccess = true;
+            std::vector<int> featDx(images.size() - 1, 0);
+            std::vector<int> featDy(images.size() - 1, 0);
+            std::vector<double> featFdx(images.size() - 1, 0.0);
+            std::vector<double> featFdy(images.size() - 1, 0.0);
+            std::vector<bool> featOk(images.size() - 1, false);
+
+            for (size_t i = 0; i < images.size() - 1; ++i) {
+                int dx = 0, dy = 0;
+                double fdx = 0, fdy = 0;
+                if (featureAlign(images[i], images[i + 1], dx, dy, fdx, fdy)) {
+                    featDx[i] = dx;
+                    featDy[i] = dy;
+                    featFdx[i] = fdx;
+                    featFdy[i] = fdy;
+                    featOk[i] = true;
+                } else {
+                    allSuccess = false;
+                }
+            }
+
+            // For pairs where feature alignment failed, fall back to MTB
+            if (!allSuccess) {
+                // Prepare MTB pyramid data for failed pairs
+                for (size_t i = 0; i < images.size(); ++i) {
+                    images[i].preScale();
+                }
+                for (size_t i = 0; i < images.size() - 1; ++i) {
+                    if (!featOk[i]) {
+                        Log::debug("Image ", i, ": using MTB fallback");
+                        images[i].alignWith(images[i + 1]);
+                        featDx[i] = images[i].getDeltaX();
+                        featDy[i] = images[i].getDeltaY();
+                        featFdx[i] = 0.0;
+                        featFdy[i] = 0.0;
+                        // Reset dx/dy since we'll accumulate below
+                        images[i].displace(-images[i].getDeltaX(), -images[i].getDeltaY());
+                    }
+                }
+                for (auto & img : images) {
+                    img.releaseAlignData();
+                }
+            }
+
+            // Accumulate pairwise displacements (darkest image = reference = zero offset)
+            for (size_t i = images.size() - 1; i > 0; --i) {
+                int prevDx = images[i].getDeltaX();
+                int prevDy = images[i].getDeltaY();
+                images[i - 1].displace(prevDx + featDx[i - 1], prevDy + featDy[i - 1]);
+                Log::debug("Image ", i - 1, " displaced to (",
+                           images[i - 1].getDeltaX(), ", ",
+                           images[i - 1].getDeltaY(), ")");
+            }
+
+            // Store fractional offsets (accumulated from pairwise)
+            double accumFdx = 0.0, accumFdy = 0.0;
+            for (int i = (int)images.size() - 2; i >= 0; --i) {
+                accumFdx += featFdx[i];
+                accumFdy += featFdy[i];
+                images[i].setFracDx(accumFdx);
+                images[i].setFracDy(accumFdy);
+                Log::debug("Image ", i, " fractional offset: (",
+                           accumFdx, ", ", accumFdy, ")");
+            }
+            images.back().setFracDx(0.0);
+            images.back().setFracDy(0.0);
+            return;
         }
 #else
         if (useFeatures) {
-            Log::progress("Feature-based alignment requested but OpenCV not available, using MTB");
+            Log::debug("Feature-based alignment requested but OpenCV not available, using MTB");
         }
 #endif
+        // MTB alignment (default / fallback)
         Timer t("Align");
         size_t errors[images.size()];
         #pragma omp parallel for schedule(dynamic)
@@ -237,10 +583,12 @@ void ImageStack::crop() {
 }
 
 
-void ImageStack::computeResponseFunctions() {
+void ImageStack::computeResponseFunctions(bool linearMode) {
     Timer t("Compute response functions");
-    for (int i = images.size() - 2; i >= 0; --i) {
-        images[i].computeResponseFunction(images[i + 1]);
+    // Fit each image against the reference (darkest) directly, not chained pairwise
+    const Image & ref = images.back();
+    for (int i = (int)images.size() - 2; i >= 0; --i) {
+        images[i].computeResponseFunction(ref, linearMode);
     }
 }
 
@@ -672,14 +1020,19 @@ void ImageStack::correctHotPixels(const RawParameters & params, float sigma) {
             corrected++;
         }
     }
-    Log::progress("Hot pixel correction: ", corrected, " pixels corrected (sigma=", sigma, ")");
+    Log::debug("Hot pixel correction: ", corrected, " pixels corrected (sigma=", sigma, ")");
 }
 
 
 // Estimate noise model parameters for DNG NoiseProfile tag (51041).
 // For each channel c: variance = S[c] * signal + O[c], with signal normalized to [0,1].
-// S = shot noise coefficient (Poisson), O = read noise (estimated from masked pixels).
-// Both scaled by 1/numImages for the merged result.
+// S = shot noise coefficient (Poisson), O = read noise variance.
+// Both estimated from actual pixel data using tile-based variance-vs-signal regression:
+//   Var(raw) = S_raw * raw_signal + O_raw
+// The 25th percentile of tile variances at each signal level provides robustness
+// against texture contamination (smooth tiles dominate the low percentile).
+// For cameras with optical black margins (topMargin/leftMargin > 0), O is refined
+// using MAD of OB pixels. Both scaled by 1/numImages for the merged result.
 static void estimateNoiseProfile(const std::vector<Image> & images,
                                   const RawParameters & params,
                                   int numImages, double noiseProfile[8]) {
@@ -687,51 +1040,302 @@ static void estimateNoiseProfile(const std::vector<Image> & images,
     if (range <= 0.0) return;
 
     for (int c = 0; c < params.colors; ++c) {
-        // Shot noise coefficient: 1 / (max - cblack[c])
         double channelRange = range - params.cblack[c];
         if (channelRange <= 0.0) channelRange = range;
-        double S = 1.0 / channelRange;
 
-        // Read noise: estimate from masked/black pixel regions across all exposures
-        double sumSq = 0.0;
-        double sum = 0.0;
-        size_t count = 0;
+        // --- Tile-based variance-vs-signal regression from active pixels ---
+        // Collect tiles of same-color pixels, compute per-tile mean and variance,
+        // then fit the affine noise model Var = S_raw * signal + O_raw.
+        const int tileStep = (params.FC.getFilters() == 9) ? 6 : 2;
+        const int tileSameColorSize = 4;
+        const int rawTileSize = tileSameColorSize * tileStep;
+
+        struct TileStat { double mean; double variance; };
+        std::vector<TileStat> tileStats;
+        tileStats.reserve(10000);
 
         for (const auto & img : images) {
-            // Top margin pixels
-            for (size_t y = 0; y < params.topMargin && y < img.getHeight(); ++y) {
-                for (size_t x = 0; x < img.getWidth(); ++x) {
-                    if (params.FC(x, y) == c && img.contains(x, y)) {
-                        double v = static_cast<double>(img(x, y)) - params.cblack[c];
-                        sum += v;
-                        sumSq += v * v;
-                        ++count;
+            size_t imgW = img.getWidth(), imgH = img.getHeight();
+            for (size_t ty = 0; ty + rawTileSize <= imgH; ty += rawTileSize) {
+                for (size_t tx = 0; tx + rawTileSize <= imgW; tx += rawTileSize) {
+                    // Find starting position matching channel c
+                    int sx = -1, sy = -1;
+                    for (int dy = 0; dy < tileStep && sx < 0; ++dy) {
+                        for (int dx = 0; dx < tileStep; ++dx) {
+                            if (params.FC(tx + dx, ty + dy) == c) {
+                                sx = tx + dx; sy = ty + dy;
+                                break;
+                            }
+                        }
                     }
+                    if (sx < 0) continue;
+
+                    double sum = 0, sumSq = 0;
+                    int cnt = 0;
+                    for (int j = 0; j < tileSameColorSize; ++j) {
+                        for (int i = 0; i < tileSameColorSize; ++i) {
+                            int x = sx + i * tileStep;
+                            int y = sy + j * tileStep;
+                            if (x < 0 || (size_t)x >= imgW ||
+                                y < 0 || (size_t)y >= imgH) continue;
+                            if (!img.contains(x, y)) continue;
+                            uint16_t raw = img(x, y);
+                            if (raw < 1 || img.isSaturated(raw)) continue;
+                            double v = static_cast<double>(raw);
+                            sum += v; sumSq += v * v; cnt++;
+                        }
+                    }
+                    if (cnt < 8) continue;
+                    double mean = sum / cnt;
+                    double variance = (sumSq - sum * sum / cnt) / (cnt - 1);
+                    if (variance >= 0) tileStats.push_back({mean, variance});
                 }
             }
-            // Left margin pixels (below top margin to avoid double-counting)
-            for (size_t y = params.topMargin; y < img.getHeight(); ++y) {
-                for (size_t x = 0; x < params.leftMargin && x < img.getWidth(); ++x) {
-                    if (params.FC(x, y) == c && img.contains(x, y)) {
-                        double v = static_cast<double>(img(x, y)) - params.cblack[c];
-                        sum += v;
-                        sumSq += v * v;
-                        ++count;
+        }
+
+        double S_raw = 1.0; // Theoretical fallback: gain = 1 e/ADU
+        double O_raw = 1.0; // Conservative fallback
+        double S_spatial = -1.0; // From spatial tile regression
+        double S_temporal = -1.0; // From inter-frame residual variance
+
+        // --- Method 1: Spatial high-pass tile regression (Android Camera2 approach) ---
+        if (tileStats.size() >= 100) {
+            double maxMean = 0;
+            for (auto & t : tileStats) if (t.mean > maxMean) maxMean = t.mean;
+
+            if (maxMean > 100) {
+                const int numBins = 32;
+                double binWidth = maxMean / numBins;
+
+                // Bin by mean signal, take 25th percentile variance per bin
+                std::vector<double> binMeans, binP25Vars;
+                for (int b = 0; b < numBins; ++b) {
+                    double bLow = b * binWidth, bHigh = (b + 1) * binWidth;
+                    std::vector<double> vars;
+                    double sigSum = 0;
+                    for (auto & t : tileStats) {
+                        if (t.mean >= bLow && t.mean < bHigh) {
+                            vars.push_back(t.variance);
+                            sigSum += t.mean;
+                        }
+                    }
+                    if (vars.size() < 10) continue;
+                    size_t p25 = vars.size() / 4;
+                    std::nth_element(vars.begin(), vars.begin() + p25, vars.end());
+                    binMeans.push_back(sigSum / vars.size());
+                    binP25Vars.push_back(vars[p25]);
+                }
+
+                if (binMeans.size() >= 3) {
+                    int n = (int)binMeans.size();
+                    double sX = 0, sY = 0, sXX = 0, sXY = 0;
+                    for (int i = 0; i < n; ++i) {
+                        sX += binMeans[i]; sY += binP25Vars[i];
+                        sXX += binMeans[i] * binMeans[i];
+                        sXY += binMeans[i] * binP25Vars[i];
+                    }
+                    double denom = n * sXX - sX * sX;
+                    if (std::abs(denom) > 1e-10) {
+                        double slope = (n * sXY - sX * sY) / denom;
+                        double intercept = (sY - slope * sX) / n;
+                        if (slope > 0 && slope < 10.0) {
+                            S_spatial = slope;
+                            S_raw = slope;
+                        }
+                        if (intercept > 0) {
+                            O_raw = intercept;
+                        }
                     }
                 }
             }
         }
 
-        double O;
-        if (count > 1) {
-            O = (sumSq - sum * sum / count) / (count - 1) / (channelRange * channelRange);
-        } else {
-            O = 1e-6; // Conservative fallback
+        // --- Method 2: Temporal variance across aligned exposures ---
+        // For each pair of images, compute the exposure-normalized residual at
+        // overlapping unsaturated same-color pixels, bin by signal level, and
+        // regress to get S. This naturally separates noise from structure since
+        // the scene is constant across frames. (Caveat: alignment residuals add
+        // bias on high-frequency texture; the 25th percentile filter helps.)
+        if (numImages >= 2) {
+            const Image & ref = images.back(); // darkest = reference
+            struct TemporalBin { double sumSig; double sumResidSq; int count; };
+            const int tNumBins = 32;
+            std::vector<TemporalBin> tBins(tNumBins);
+            for (auto & b : tBins) { b.sumSig = 0; b.sumResidSq = 0; b.count = 0; }
+            double refExp = ref.getRelativeExposure();
+            double maxSig = 0;
+
+            // Find starting pixel for channel c in CFA pattern
+            int cStartX = -1, cStartY = -1;
+            for (int dy = 0; dy < tileStep && cStartX < 0; ++dy) {
+                for (int dx = 0; dx < tileStep; ++dx) {
+                    if (params.FC(dx, dy) == c) {
+                        cStartX = dx; cStartY = dy; break;
+                    }
+                }
+            }
+            if (cStartX < 0) cStartX = cStartY = 0;
+            // Subsample: step by 2*tileStep (every other same-color pixel)
+            const int tSubStep = tileStep * 2;
+
+            // First pass: find max unsaturated signal in reference for binning
+            for (size_t y = cStartY; y < ref.getHeight(); y += tSubStep) {
+                for (size_t x = cStartX; x < ref.getWidth(); x += tSubStep) {
+                    if (!ref.contains(x, y)) continue;
+                    uint16_t rv = ref(x, y);
+                    if (rv > 0 && !ref.isSaturated(rv) && rv > maxSig) maxSig = rv;
+                }
+            }
+
+            if (maxSig > 100) {
+                double tBinWidth = maxSig / tNumBins;
+
+                // Collect residuals from each non-reference image vs reference
+                for (int k = 0; k < numImages - 1; ++k) {
+                    // raw_ref = raw_k * (slope_k / slope_ref) for the same scene radiance
+                    double ratio = images[k].getRelativeExposure() / refExp;
+                    for (size_t y = cStartY; y < ref.getHeight(); y += tSubStep) {
+                        for (size_t x = cStartX; x < ref.getWidth(); x += tSubStep) {
+                            if (!ref.contains(x, y) || !images[k].contains(x, y)) continue;
+                            uint16_t rv = ref(x, y);
+                            uint16_t kv = images[k](x, y);
+                            if (rv < 1 || ref.isSaturated(rv)) continue;
+                            if (kv < 1 || images[k].isSaturated(kv)) continue;
+
+                            // Smoothness filter: skip high-gradient (textured) pixels
+                            // where alignment residuals inflate temporal variance.
+                            // Check same-color neighbors in reference at ±tileStep.
+                            int xl = (int)x - tileStep, xr = (int)x + tileStep;
+                            int yt = (int)y - tileStep, yb = (int)y + tileStep;
+                            double maxGrad = 0;
+                            if (xl >= 0 && ref.contains(xl, y))
+                                maxGrad = std::max(maxGrad, std::abs((double)rv - ref(xl, y)));
+                            if ((size_t)xr < ref.getWidth() && ref.contains(xr, y))
+                                maxGrad = std::max(maxGrad, std::abs((double)rv - ref(xr, y)));
+                            if (yt >= 0 && ref.contains(x, yt))
+                                maxGrad = std::max(maxGrad, std::abs((double)rv - ref(x, yt)));
+                            if ((size_t)yb < ref.getHeight() && ref.contains(x, yb))
+                                maxGrad = std::max(maxGrad, std::abs((double)rv - ref(x, yb)));
+                            // Skip if max gradient > 5% of signal (textured region)
+                            if (maxGrad > 0.05 * rv) continue;
+
+                            // Predicted reference value from image k
+                            double predicted = kv * ratio;
+                            double residual = (double)rv - predicted;
+                            // Var(residual) = Var(rv) + ratio^2 * Var(kv)
+                            //               = (S*rv + O) + ratio^2 * (S*kv + O)
+                            // Effective signal for binning: rv
+                            int bin = (int)(rv / tBinWidth);
+                            if (bin < 0) bin = 0;
+                            if (bin >= tNumBins) bin = tNumBins - 1;
+                            // Store the residual^2 normalized by the combined variance denominator
+                            // For regression: E[res^2] = S*(rv + ratio^2*kv) + O*(1 + ratio^2)
+                            // We'll regress E[res^2] vs (rv + ratio^2*kv) to get S as slope
+                            double combinedSig = (double)rv + ratio * ratio * (double)kv;
+                            tBins[bin].sumSig += combinedSig;
+                            tBins[bin].sumResidSq += residual * residual;
+                            tBins[bin].count++;
+                        }
+                    }
+                }
+
+                // Fit: E[res^2] = S_temporal * combinedSig + intercept
+                std::vector<double> tMeans, tVars;
+                int totalSamples = 0;
+                for (int b = 0; b < tNumBins; ++b) {
+                    totalSamples += tBins[b].count;
+                    if (tBins[b].count < 50) continue;
+                    tMeans.push_back(tBins[b].sumSig / tBins[b].count);
+                    tVars.push_back(tBins[b].sumResidSq / tBins[b].count);
+                }
+
+                if (tMeans.size() >= 3) {
+                    int n = (int)tMeans.size();
+                    double sX = 0, sY = 0, sXX = 0, sXY = 0;
+                    for (int i = 0; i < n; ++i) {
+                        sX += tMeans[i]; sY += tVars[i];
+                        sXX += tMeans[i] * tMeans[i];
+                        sXY += tMeans[i] * tVars[i];
+                    }
+                    double denom = n * sXX - sX * sX;
+                    if (std::abs(denom) > 1e-10) {
+                        double slope = (n * sXY - sX * sY) / denom;
+                        Log::debug("Noise ch", c, " temporal: slope=", slope,
+                                 " bins=", n, " samples=", totalSamples);
+                        if (slope > 0 && slope < 10.0) {
+                            S_temporal = slope;
+                        }
+                    }
+                } else {
+                    Log::debug("Noise ch", c, " temporal: insufficient bins (",
+                             tMeans.size(), ") samples=", totalSamples,
+                             " maxSig=", maxSig);
+                }
+            }
         }
+
+        // --- Cross-validate: log both, prefer spatial unless temporal is clearly better ---
+        // Spatial (tile-based) typically has 100x more samples and is inherently robust
+        // to alignment errors. Temporal wins only when it's lower (indicating spatial has
+        // texture contamination) AND the difference is modest (within 30%).
+        if (S_spatial > 0 && S_temporal > 0) {
+            double ratio = S_temporal / S_spatial;
+            Log::debug("Noise ch", c, " cross-val: S_spatial=", S_spatial,
+                     " S_temporal=", S_temporal, " ratio=", ratio);
+            if (S_temporal < S_spatial && ratio >= 0.7) {
+                // Temporal is lower but within 30%: likely reflects better
+                // texture rejection. Use average of both estimates.
+                S_raw = (S_spatial + S_temporal) / 2.0;
+                Log::debug("Noise ch", c, ": using mean of spatial+temporal S=", S_raw);
+            }
+            // Otherwise keep spatial S_raw (already set) — either temporal is
+            // higher (alignment residual inflation) or much lower (sampling bias)
+        } else if (S_temporal > 0 && S_spatial <= 0) {
+            S_raw = S_temporal;
+        }
+
+        // --- O: prefer MAD from OB margins if available ---
+        // Note: Image stores only the active area. OB margins are accessible only
+        // when topMargin/leftMargin > 0 and the Image coordinate space overlaps them.
+        // For many cameras (e.g., Nikon Z 9) margins are 0 and we rely on the
+        // regression intercept computed above.
+        if (params.topMargin > 0 || params.leftMargin > 0) {
+            std::vector<double> obValues;
+            for (const auto & img : images) {
+                for (size_t y = 0; y < params.topMargin && y < img.getHeight(); ++y) {
+                    for (size_t x = 0; x < img.getWidth(); ++x) {
+                        if (params.FC(x, y) == c && img.contains(x, y))
+                            obValues.push_back(static_cast<double>(img(x, y)));
+                    }
+                }
+                for (size_t y = params.topMargin; y < img.getHeight(); ++y) {
+                    for (size_t x = 0; x < params.leftMargin && x < img.getWidth(); ++x) {
+                        if (params.FC(x, y) == c && img.contains(x, y))
+                            obValues.push_back(static_cast<double>(img(x, y)));
+                    }
+                }
+            }
+            if (obValues.size() > 10) {
+                size_t n = obValues.size();
+                std::nth_element(obValues.begin(), obValues.begin() + n/2, obValues.end());
+                double median = obValues[n/2];
+                for (auto & v : obValues) v = std::abs(v - median);
+                std::nth_element(obValues.begin(), obValues.begin() + n/2, obValues.end());
+                double mad = obValues[n/2] * 1.4826;
+                O_raw = mad * mad;
+            }
+        }
+
+        double S_dng = S_raw / channelRange;
+        double O_dng = O_raw / (channelRange * channelRange);
+
+        Log::debug("Noise ch", c, ": S=", S_dng, " O=", O_dng,
+                 " (S_raw=", S_raw, " O_raw=", O_raw,
+                 " tiles=", tileStats.size(), ")");
 
         // Scale for merge: variance scales as 1/N
-        noiseProfile[c * 2]     = S / numImages;
-        noiseProfile[c * 2 + 1] = O / numImages;
+        noiseProfile[c * 2]     = S_dng / numImages;
+        noiseProfile[c * 2 + 1] = O_dng / numImages;
     }
 }
 
@@ -774,7 +1378,7 @@ static inline double interpolateCFA(const Image & img, int x, int y,
 }
 
 
-ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, double clipPercentile, bool subPixelAlign) const {
+ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, DeghostMode deghostMode, int deghostIterations, double clipPercentile, bool subPixelAlign) const {
     int imageMax = images.size() - 1;
     BoxBlur map(fattenMask(mask, featherRadius));
     measureTime("Blur", [&] () {
@@ -785,14 +1389,7 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
     dst.displace(-(int)params.leftMargin, -(int)params.topMargin);
     dst.fillBorders(0.f);
 
-    // Poisson-optimal merge: weight each exposure by 1/relativeExposure (∝ exposure time).
-    // This is the MLE weight for Poisson noise — longer exposures captured more photons
-    // and thus have lower relative noise, so they get higher weight.
     const int numImages = (int)images.size();
-    std::vector<double> baseWeight(numImages);
-    for (int k = 0; k < numImages; k++) {
-        baseWeight[k] = 1.0 / images[k].getRelativeExposure();
-    }
 
     // Per-channel saturation rolloff: each channel uses its own clipping threshold
     double satRolloffPerCh[4], satRolloffRangePerCh[4], satThreshPerCh[4];
@@ -843,23 +1440,7 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         noiseB[c] = noiseProfile[c * 2 + 1] * numImages * channelRange * channelRange;
     }
 
-    // Shadow transition point: below this raw level, read noise dominates shot noise
-    // and variance-based weighting improves SNR. Above it, Poisson weights are optimal.
-    // Crossover is where shot noise = read noise: a * raw = b, so raw = b/a
-    double shadowThresh[4], shadowBlendRange[4];
-    for (int c = 0; c < 4; ++c) {
-        if (noiseA[c] > 0.0) {
-            shadowThresh[c] = noiseB[c] / noiseA[c];
-            // Blend over 2x the crossover range for smooth transition
-            shadowBlendRange[c] = shadowThresh[c];
-            if (shadowBlendRange[c] < 1.0) shadowBlendRange[c] = 1.0;
-        } else {
-            shadowThresh[c] = 0.0;
-            shadowBlendRange[c] = 1.0;
-        }
-    }
-
-    // Pre-compute per-exposure relativeExposure for variance computation
+    // Pre-compute per-exposure relativeExposure for MLE variance weighting
     std::vector<double> relExp(numImages);
     for (int k = 0; k < numImages; k++) {
         relExp[k] = images[k].getRelativeExposure();
@@ -867,60 +1448,191 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
 
     // Pre-compute spatial ghost confidence map for coherent deghosting
     Array2D<float> ghostMap;
+    int refIdx = 0; // reference exposure index for robust deghosting
     if (deghost) {
         ghostMap = Array2D<float>(width, height);
-        #pragma omp parallel for schedule(dynamic,16)
-        for (size_t y = 0; y < height; ++y) {
-            std::vector<double> tmpRad(numImages), tmpDev(numImages), tmpSort(numImages);
-            for (size_t x = 0; x < width; ++x) {
-                int ch = params.FC(x, y);
-                int nv = 0;
-                for (int k = 0; k <= imageMax; k++) {
-                    if (!images[k].contains(x, y)) continue;
-                    uint16_t raw = images[k](x, y);
-                    if (raw < 1 || raw >= satThreshPerCh[ch]) continue;
-                    tmpRad[nv++] = images[k].exposureAt(x, y);
+
+        if (deghostMode == DeghostMode::Robust) {
+            // Reference-guided deghosting (Granados 2013 / Khan 2006 approach)
+            // Select reference: middle exposure (best SNR in mid-tones, least motion blur)
+            refIdx = numImages / 2;
+            Log::debug("Robust deghost: ref=image[", refIdx, "] sigma=", deghostSigma,
+                       " iterations=", deghostIterations);
+
+            for (int iter = 0; iter < deghostIterations; ++iter) {
+                // Compute per-pixel ghost confidence as max normalized residual vs reference
+                #pragma omp parallel for schedule(dynamic,16)
+                for (size_t y = 0; y < height; ++y) {
+                    for (size_t x = 0; x < width; ++x) {
+                        int ch = params.FC(x, y);
+
+                        // Get reference radiance
+                        if (!images[refIdx].contains(x, y)) {
+                            ghostMap(x, y) = 0.0f;
+                            continue;
+                        }
+                        uint16_t refRaw = images[refIdx](x, y);
+                        if (refRaw < 1 || refRaw >= satThreshPerCh[ch]) {
+                            ghostMap(x, y) = 0.0f;
+                            continue;
+                        }
+                        double refRad = images[refIdx].exposureAt(x, y);
+                        if (refRad <= 0.0) { ghostMap(x, y) = 0.0f; continue; }
+
+                        // Noise-aware threshold: sigma_noise at the reference signal level
+                        double refVar = noiseA[ch] * refRaw + noiseB[ch];
+                        if (refVar < noiseB[ch]) refVar = noiseB[ch];
+                        if (refVar < 1.0) refVar = 1.0;
+                        // Convert raw variance to radiance variance via response slope
+                        double refSlope = relExp[refIdx];
+                        double radVar = refVar * refSlope * refSlope;
+                        double noiseSigma = std::sqrt(radVar);
+
+                        // Max normalized residual across non-reference exposures
+                        double maxNormRes = 0.0;
+                        int nValid = 0;
+                        for (int k = 0; k <= imageMax; k++) {
+                            if (k == refIdx) continue;
+                            if (!images[k].contains(x, y)) continue;
+                            uint16_t raw = images[k](x, y);
+                            if (raw < 1 || raw >= satThreshPerCh[ch]) continue;
+                            double rad = images[k].exposureAt(x, y);
+                            if (rad <= 0.0) continue;
+                            double residual = std::abs(rad - refRad);
+                            double normRes = (noiseSigma > 0.0) ? residual / noiseSigma : 0.0;
+                            if (normRes > maxNormRes) maxNormRes = normRes;
+                            nValid++;
+                        }
+
+                        if (nValid < 1) {
+                            ghostMap(x, y) = 0.0f;
+                        } else {
+                            // Map normalized residual to confidence via sigmoid-like ramp
+                            // Below deghostSigma: confidence = 0 (noise)
+                            // Above 2*deghostSigma: confidence = 1 (definite ghost)
+                            float conf = 0.0f;
+                            if (maxNormRes > deghostSigma) {
+                                conf = static_cast<float>(
+                                    std::min(1.0, (maxNormRes - deghostSigma) / deghostSigma));
+                            }
+                            ghostMap(x, y) = conf;
+                        }
+                    }
                 }
-                if (nv < 3) { ghostMap(x, y) = 0.0f; continue; }
 
-                // MAD-based ghost confidence
-                tmpSort.assign(tmpRad.begin(), tmpRad.begin() + nv);
-                std::nth_element(tmpSort.begin(), tmpSort.begin() + nv/2, tmpSort.end());
-                double median = tmpSort[nv/2];
-                for (int i = 0; i < nv; i++)
-                    tmpDev[i] = std::abs(tmpRad[i] - median);
-                std::nth_element(tmpDev.begin(), tmpDev.begin() + nv/2, tmpDev.begin() + nv);
-                double mad = tmpDev[nv/2] * 1.4826;
+                // Edge-aware spatial filter: bilateral-like on CFA neighbors
+                // Uses intensity similarity to reference to preserve ghost boundaries
+                Array2D<float> tmpMap(width, height);
+                const int filterR = 2; // radius in pixels
+                const double spatialSigma = 1.5;
+                const double rangeSigma = 0.1; // fraction of reference radiance
 
-                double maxDev = *std::max_element(tmpDev.begin(), tmpDev.begin() + nv);
-                float confidence = (mad > 0.0) ? static_cast<float>(maxDev / (deghostSigma * mad)) : 0.0f;
-                ghostMap(x, y) = std::min(confidence, 1.0f);
-            }
-        }
+                #pragma omp parallel for schedule(dynamic,16)
+                for (size_t y = 0; y < height; ++y) {
+                    for (size_t x = 0; x < width; ++x) {
+                        if (!images[refIdx].contains(x, y)) {
+                            tmpMap(x, y) = ghostMap(x, y);
+                            continue;
+                        }
+                        double centerRad = images[refIdx].exposureAt(x, y);
+                        if (centerRad <= 0.0) centerRad = 1.0;
+                        double rangeScale = rangeSigma * centerRad;
+                        if (rangeScale < 1.0) rangeScale = 1.0;
+                        double invRange2 = 1.0 / (2.0 * rangeScale * rangeScale);
+                        double invSpatial2 = 1.0 / (2.0 * spatialSigma * spatialSigma);
 
-        // Spatial filter: separable 3x3 box blur for ghost map coherence
-        Array2D<float> tmpMap(width, height);
-        #pragma omp parallel for
-        for (size_t y = 0; y < height; ++y) {
-            for (size_t x = 0; x < width; ++x) {
-                float sum = ghostMap(x, y);
-                int count = 1;
-                if (x > 0) { sum += ghostMap(x-1, y); count++; }
-                if (x + 1 < width) { sum += ghostMap(x+1, y); count++; }
-                tmpMap(x, y) = sum / count;
+                        double wSum = 0.0, vSum = 0.0;
+                        for (int dy = -filterR; dy <= filterR; ++dy) {
+                            int ny = (int)y + dy;
+                            if (ny < 0 || ny >= (int)height) continue;
+                            for (int dx = -filterR; dx <= filterR; ++dx) {
+                                int nx = (int)x + dx;
+                                if (nx < 0 || nx >= (int)width) continue;
+                                double spatW = std::exp(-(dx*dx + dy*dy) * invSpatial2);
+                                double nRad = images[refIdx].contains(nx, ny)
+                                    ? images[refIdx].exposureAt(nx, ny) : centerRad;
+                                double rangeW = std::exp(-(nRad - centerRad) * (nRad - centerRad) * invRange2);
+                                double w = spatW * rangeW;
+                                wSum += w;
+                                vSum += w * ghostMap(nx, ny);
+                            }
+                        }
+                        tmpMap(x, y) = (wSum > 0.0) ? static_cast<float>(vSum / wSum) : ghostMap(x, y);
+                    }
+                }
+                // Copy filtered result back
+                #pragma omp parallel for
+                for (size_t y = 0; y < height; ++y)
+                    for (size_t x = 0; x < width; ++x)
+                        ghostMap(x, y) = tmpMap(x, y);
+
+                if (deghostIterations > 1) {
+                    // Count ghost pixels for logging
+                    long long ghostCount = 0;
+                    #pragma omp parallel for reduction(+:ghostCount)
+                    for (size_t y = 0; y < height; ++y)
+                        for (size_t x = 0; x < width; ++x)
+                            if (ghostMap(x, y) > 0.1f) ghostCount++;
+                    double ghostPct = 100.0 * ghostCount / (width * height);
+                    Log::debug("Deghost iter ", iter + 1, ": ", ghostPct, "% ghost pixels");
+                }
             }
-        }
-        #pragma omp parallel for
-        for (size_t y = 0; y < height; ++y) {
-            for (size_t x = 0; x < width; ++x) {
-                float sum = tmpMap(x, y);
-                int count = 1;
-                if (y > 0) { sum += tmpMap(x, y-1); count++; }
-                if (y + 1 < height) { sum += tmpMap(x, y+1); count++; }
-                ghostMap(x, y) = sum / count;
+            Log::debug("Reference-guided ghost map computed (bilateral filtered)");
+        } else {
+            // Legacy MAD-based ghost confidence
+            #pragma omp parallel for schedule(dynamic,16)
+            for (size_t y = 0; y < height; ++y) {
+                std::vector<double> tmpRad(numImages), tmpDev(numImages), tmpSort(numImages);
+                for (size_t x = 0; x < width; ++x) {
+                    int ch = params.FC(x, y);
+                    int nv = 0;
+                    for (int k = 0; k <= imageMax; k++) {
+                        if (!images[k].contains(x, y)) continue;
+                        uint16_t raw = images[k](x, y);
+                        if (raw < 1 || raw >= satThreshPerCh[ch]) continue;
+                        tmpRad[nv++] = images[k].exposureAt(x, y);
+                    }
+                    if (nv < 3) { ghostMap(x, y) = 0.0f; continue; }
+
+                    // MAD-based ghost confidence
+                    tmpSort.assign(tmpRad.begin(), tmpRad.begin() + nv);
+                    std::nth_element(tmpSort.begin(), tmpSort.begin() + nv/2, tmpSort.end());
+                    double median = tmpSort[nv/2];
+                    for (int i = 0; i < nv; i++)
+                        tmpDev[i] = std::abs(tmpRad[i] - median);
+                    std::nth_element(tmpDev.begin(), tmpDev.begin() + nv/2, tmpDev.begin() + nv);
+                    double mad = tmpDev[nv/2] * 1.4826;
+
+                    double maxDev = *std::max_element(tmpDev.begin(), tmpDev.begin() + nv);
+                    float confidence = (mad > 0.0) ? static_cast<float>(maxDev / (deghostSigma * mad)) : 0.0f;
+                    ghostMap(x, y) = std::min(confidence, 1.0f);
+                }
             }
+
+            // Spatial filter: separable 3x3 box blur for ghost map coherence
+            Array2D<float> tmpMap(width, height);
+            #pragma omp parallel for
+            for (size_t y = 0; y < height; ++y) {
+                for (size_t x = 0; x < width; ++x) {
+                    float sum = ghostMap(x, y);
+                    int count = 1;
+                    if (x > 0) { sum += ghostMap(x-1, y); count++; }
+                    if (x + 1 < width) { sum += ghostMap(x+1, y); count++; }
+                    tmpMap(x, y) = sum / count;
+                }
+            }
+            #pragma omp parallel for
+            for (size_t y = 0; y < height; ++y) {
+                for (size_t x = 0; x < width; ++x) {
+                    float sum = tmpMap(x, y);
+                    int count = 1;
+                    if (y > 0) { sum += tmpMap(x, y-1); count++; }
+                    if (y + 1 < height) { sum += tmpMap(x, y+1); count++; }
+                    ghostMap(x, y) = sum / count;
+                }
+            }
+            Log::debug("Legacy ghost map computed (MAD + box blur)");
         }
-        Log::debug("Ghost map computed with spatial coherence filter");
     }
 
     float maxVal = 0.0;
@@ -928,6 +1640,7 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
     for (size_t y = 0; y < height; ++y) {
         std::vector<double> radiances(numImages);
         std::vector<double> weights(numImages);
+        std::vector<int> exposureIdx(numImages);
         std::vector<double> absDevs(numImages);
         std::vector<double> sorted(numImages);
 
@@ -949,34 +1662,22 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                 }
 
                 if (raw < 1) continue;
-                if (raw >= satThreshPerCh[ch]) continue;
+                // When Bayer-block rolloff is active, use the block (minimum) threshold
+                // for hard rejection so all CFA channels clip at the same level.
+                // This prevents per-channel path divergence (merge vs fallback) that
+                // causes color fringe at blown highlight boundaries.
+                double hardThresh = useBlockRolloff ? blockThresh : satThreshPerCh[ch];
+                if (raw >= hardThresh) continue;
 
-                // Blend between Poisson weight (1/relExp) and variance weight
-                // (1/Var(radiance)) based on signal level. In shadows where read
-                // noise dominates, variance weighting properly accounts for the
-                // constant noise floor. In mid-tones/highlights, Poisson weight
-                // is optimal and avoids response function edge cases.
-                double w;
-                if (raw < shadowThresh[ch] + shadowBlendRange[ch]) {
-                    // Variance weight: w = 1 / (relExp^2 * (a*raw + b))
-                    // Floor pixelVar at the read noise term to prevent weight
-                    // explosion when raw is near zero in short exposures.
-                    double pixelVar = noiseA[ch] * raw + noiseB[ch];
-                    if (pixelVar < noiseB[ch]) pixelVar = noiseB[ch];
-                    if (pixelVar < 1.0) pixelVar = 1.0;
-                    double variance = relExp[k] * relExp[k] * pixelVar;
-                    double varWeight = 1.0 / variance;
-
-                    if (raw <= shadowThresh[ch]) {
-                        w = varWeight;
-                    } else {
-                        // Smooth blend from variance to Poisson weight
-                        double t = (raw - shadowThresh[ch]) / shadowBlendRange[ch];
-                        w = varWeight * (1.0 - t) + baseWeight[k] * t;
-                    }
-                } else {
-                    w = baseWeight[k];
-                }
+                // Unified MLE weight: w = 1 / (relExp^2 * Var(raw))
+                // where Var(raw) = a*raw + b (affine noise model).
+                // This is the inverse-variance weight for the radiance estimate,
+                // optimal across the full tonal range — shot-noise-dominated
+                // highlights and read-noise-dominated shadows alike.
+                double pixelVar = noiseA[ch] * raw + noiseB[ch];
+                if (pixelVar < noiseB[ch]) pixelVar = noiseB[ch];
+                if (pixelVar < 1.0) pixelVar = 1.0;
+                double w = 1.0 / (relExp[k] * relExp[k] * pixelVar);
                 if (useBlockRolloff) {
                     if (raw >= blockThresh) {
                         w = 0.0;
@@ -998,36 +1699,90 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
 
                 radiances[numValid] = radiance;
                 weights[numValid] = w;
+                exposureIdx[numValid] = k;
                 numValid++;
             }
 
             // Spatially coherent ghost detection: use pre-computed ghost map to
-            // modulate per-pixel deghosting strength, preventing salt-and-pepper
-            // artifacts at ghost boundaries
-            if (deghost && numValid >= 3 && ghostMap(x, y) > 0.1f) {
+            // modulate per-pixel deghosting strength
+            if (deghost && numValid >= 2 && ghostMap(x, y) > 0.1f) {
                 double ghostStrength = static_cast<double>(ghostMap(x, y));
 
-                // Find median radiance (partial sort)
-                sorted.assign(radiances.begin(), radiances.begin() + numValid);
-                std::nth_element(sorted.begin(), sorted.begin() + numValid / 2, sorted.end());
-                double median = sorted[numValid / 2];
-
-                // Compute MAD
-                for (int i = 0; i < numValid; i++)
-                    absDevs[i] = std::abs(radiances[i] - median);
-                std::nth_element(absDevs.begin(), absDevs.begin() + numValid / 2, absDevs.begin() + numValid);
-                double mad = absDevs[numValid / 2] * 1.4826; // MAD to sigma
-
-                // Soft Gaussian deghosting modulated by spatial ghost confidence.
-                // ghostStrength=1.0: full deghosting (original behavior).
-                // ghostStrength=0.0: no deghosting. Smooth spatial transitions.
-                if (mad > 0.0) {
-                    double threshold = deghostSigma * mad;
-                    double invThreshSq = 1.0 / (threshold * threshold);
+                if (deghostMode == DeghostMode::Robust) {
+                    // Reference-guided: compare each exposure to reference radiance.
+                    // Use Tukey biweight (ghostStrength > 0.7) for clean exclusion,
+                    // Huber (0.1 < ghostStrength <= 0.7) for graduated blending.
+                    double refRad = 0.0;
+                    int refValidIdx = -1;
                     for (int i = 0; i < numValid; i++) {
-                        double dev = std::abs(radiances[i] - median);
-                        double gaussFactor = std::exp(-0.5 * dev * dev * invThreshSq);
-                        weights[i] *= (1.0 - ghostStrength) + ghostStrength * gaussFactor;
+                        if (exposureIdx[i] == refIdx) { refRad = radiances[i]; refValidIdx = i; break; }
+                    }
+                    if (refRad > 0.0) {
+                        // Noise sigma at reference level
+                        double refNoiseSigma = std::sqrt(noiseA[ch] * refRad / relExp[refIdx] + noiseB[ch])
+                                               * relExp[refIdx];
+                        if (refNoiseSigma < 1.0) refNoiseSigma = 1.0;
+                        double threshold = deghostSigma * refNoiseSigma;
+
+                        for (int i = 0; i < numValid; i++) {
+                            if (i == refValidIdx) continue;
+                            double dev = std::abs(radiances[i] - refRad);
+                            double u = dev / threshold;
+
+                            double factor;
+                            if (ghostStrength > 0.7) {
+                                // Tukey biweight: zero weight beyond threshold
+                                if (u >= 1.0) {
+                                    factor = 0.0;
+                                } else {
+                                    double t = 1.0 - u * u;
+                                    factor = t * t;
+                                }
+                            } else {
+                                // Huber: linear attenuation beyond threshold (never fully zero)
+                                if (u <= 1.0) {
+                                    factor = 1.0;
+                                } else {
+                                    factor = 1.0 / u;
+                                }
+                            }
+                            weights[i] *= (1.0 - ghostStrength) + ghostStrength * factor;
+                        }
+
+                        // Hard fallback: if ghost confidence is very high and threshold
+                        // exceeded, force reference-only to avoid ghosting artifacts
+                        if (ghostStrength > 0.9 && refValidIdx >= 0) {
+                            double totalNonRef = 0.0;
+                            for (int i = 0; i < numValid; i++)
+                                if (i != refValidIdx) totalNonRef += weights[i];
+                            if (totalNonRef < weights[refValidIdx] * 0.05) {
+                                // Non-reference weights negligible: go reference-only
+                                for (int i = 0; i < numValid; i++)
+                                    if (i != refValidIdx) weights[i] = 0.0;
+                            }
+                        }
+                    }
+                } else {
+                    // Legacy MAD-based Gaussian deghosting
+                    if (numValid >= 3) {
+                        sorted.assign(radiances.begin(), radiances.begin() + numValid);
+                        std::nth_element(sorted.begin(), sorted.begin() + numValid / 2, sorted.end());
+                        double median = sorted[numValid / 2];
+
+                        for (int i = 0; i < numValid; i++)
+                            absDevs[i] = std::abs(radiances[i] - median);
+                        std::nth_element(absDevs.begin(), absDevs.begin() + numValid / 2, absDevs.begin() + numValid);
+                        double mad = absDevs[numValid / 2] * 1.4826;
+
+                        if (mad > 0.0) {
+                            double threshold = deghostSigma * mad;
+                            double invThreshSq = 1.0 / (threshold * threshold);
+                            for (int i = 0; i < numValid; i++) {
+                                double dev = std::abs(radiances[i] - median);
+                                double gaussFactor = std::exp(-0.5 * dev * dev * invThreshSq);
+                                weights[i] *= (1.0 - ghostStrength) + ghostStrength * gaussFactor;
+                            }
+                        }
                     }
                 }
             }
@@ -1044,16 +1799,14 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
             if (totalWeight > 0.0) {
                 v = weightedSum / totalWeight;
             } else {
-                // All exposures saturated or unavailable — fall back to mask-based selection
-                double p = map(x,y);
-                p = p < 0.0 ? 0.0 : p;
-                int j = (int)p;
-                if (j > imageMax) j = imageMax;
-                if (images[j].contains(x, y)) {
-                    v = images[j].exposureAt(x, y);
-                    if (j < (int)origMask(x,y)) {
-                        v /= params.whiteMultAt(x, y);
-                    }
+                // All exposures saturated or unavailable — use darkest image.
+                // Using the darkest image (imageMax) ensures the response function
+                // slope is consistent with the merge path, and the radiance for
+                // near-clipped pixels is as high as possible. For truly clipped
+                // pixels, the high radiance normalizes to near-white, allowing
+                // the DNG processor's highlight recovery to handle it correctly.
+                if (images[imageMax].contains(x, y)) {
+                    v = images[imageMax].exposureAt(x, y);
                 } else {
                     v = 0.0;
                 }

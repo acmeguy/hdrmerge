@@ -173,13 +173,16 @@ int ImageIO::load(const LoadOptions & options, ProgressIndicator & progress) {
         // Use custom white level, but only if it's not greater than the value provided by libraw
         params.max = std::min(params.max, options.customWl);
     stack.calculateSaturationLevel(params, options.useCustomWl);
+    if (options.hotPixelSigma > 0.0f) {
+        stack.correctHotPixels(params, options.hotPixelSigma);
+    }
     if (options.align && params.canAlign()) {
         stack.align(options.alignFeatures);
         if (options.crop) {
             stack.crop();
         }
     }
-    stack.computeResponseFunctions();
+    stack.computeResponseFunctions(options.responseMode == ResponseMode::Linear);
     stack.generateMask();
     progress.advance(100, "Done loading!");
     return numImages << 1;
@@ -188,21 +191,19 @@ int ImageIO::load(const LoadOptions & options, ProgressIndicator & progress) {
 
 void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
     string cropped = stack.isCropped() ? " cropped" : "";
-    Log::msg(2, "Writing ", options.fileName, ", ", options.bps, "-bit, ", stack.getWidth(), 'x', stack.getHeight(), cropped);
+    Log::debug(options.fileName);
+    Log::debug("  ", options.bps, "-bit, ", stack.getWidth(), 'x', stack.getHeight(), cropped);
 
     RawParameters params = *rawParameters.back();
     params.width = stack.getWidth();
     params.height = stack.getHeight();
 
-    if (options.hotPixelSigma > 0.0f) {
-        progress.advance(0, "Correcting hot pixels");
-        stack.correctHotPixels(params, options.hotPixelSigma);
-    }
-
     progress.advance(5, "Rendering image");
     params.adjustWhite(stack.getImage(stack.size() - 1));
     ComposeResult composed = stack.compose(params, options.featherRadius,
                                              options.deghostSigma,
+                                             options.deghostMode,
+                                             options.deghostIterations,
                                              options.clipPercentile,
                                              options.subPixelAlign);
 

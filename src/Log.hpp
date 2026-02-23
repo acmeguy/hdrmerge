@@ -42,6 +42,7 @@ public:
     enum {
         DEBUG = 0,
         PROGRESS = 1,
+        INFO = 2,
     } Priority;
 
     template <typename... Args>

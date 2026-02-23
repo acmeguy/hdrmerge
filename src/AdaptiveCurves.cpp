@@ -125,11 +125,11 @@ static std::vector<std::pair<int,int>> fitSplineControlPoints(const std::vector<
 AdaptiveCurves predictAdaptiveCurves(const QImage & preview, const QString & modelPath) {
     AdaptiveCurves result;
     if (modelPath.isEmpty()) {
-        Log::msg(Log::PROGRESS, "ONNX model not found, skipping adaptive curves");
+        Log::debug("ONNX model not found, skipping adaptive curves");
         return result;
     }
     if (preview.isNull()) {
-        Log::msg(Log::PROGRESS, "No preview available for adaptive curves");
+        Log::debug("No preview available for adaptive curves");
         return result;
     }
 
@@ -164,7 +164,7 @@ AdaptiveCurves predictAdaptiveCurves(const QImage & preview, const QString & mod
         size_t totalElements = 1;
         for (auto s : shape) totalElements *= s;
         if (totalElements < 768) {
-            Log::msg(Log::PROGRESS, "Unexpected ONNX output size (", totalElements,
+            Log::debug("Unexpected ONNX output size (", totalElements,
                      " elements, need 768), skipping adaptive curves");
             return result;
         }
@@ -185,7 +185,7 @@ AdaptiveCurves predictAdaptiveCurves(const QImage & preview, const QString & mod
         result.blue = fitSplineControlPoints(luts[2], 20, 0.005f);
         result.valid = true;
 
-        Log::msg(Log::PROGRESS, "Adaptive curves: ", result.red.size(), "/",
+        Log::debug("Adaptive curves: ", result.red.size(), "/",
                  result.green.size(), "/", result.blue.size(), " control points (R/G/B)");
 
     } catch (const Ort::Exception & e) {
@@ -202,7 +202,7 @@ AdaptiveCurves predictAdaptiveCurves(const QImage & preview, const QString & mod
 AdaptiveCurves predictAdaptiveCurves(const QImage & preview, const QString & modelPath) {
     (void)preview;
     (void)modelPath;
-    Log::msg(Log::PROGRESS, "ONNX Runtime not available: --auto-curves requires building with ONNX Runtime support");
+    Log::debug("ONNX Runtime not available: --auto-curves requires building with ONNX Runtime support");
     return AdaptiveCurves();
 }
 

@@ -86,7 +86,7 @@ public:
     void releaseAlignData() {
         scaled.reset();
     }
-    void computeResponseFunction(const Image & nextImage);
+    void computeResponseFunction(const Image & refImage, bool linearOnly = true);
     bool operator<(const Image & r) {
         return brightness > r.brightness;
     }
