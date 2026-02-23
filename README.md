@@ -1,5 +1,7 @@
 # HDRMerge
 
+> **This is an actively maintained fork of [jcelaya/hdrmerge](https://github.com/jcelaya/hdrmerge)** with significant enhancements: Poisson-optimal weighted merge, feature-based alignment (OpenCV), concurrent batch processing, robust ghost detection, streaming DNG output, JXL compression, ARM NEON vectorization, and ACR/Lightroom profile support. See the [changelog](#changelog) for full details.
+
 HDRMerge combines two or more raw images into a single raw with an extended dynamic range. It can import any raw image supported by LibRaw, and outputs a DNG 1.4 image with floating point data. The output raw is built using Poisson-optimal weighted merging across exposures, so that shadows maintain as much detail as possible with minimal noise. This tool also offers automatic ghost detection and a GUI to manually refine the resulting image.
 
 ## Download & Installation
