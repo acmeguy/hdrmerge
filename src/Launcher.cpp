@@ -179,7 +179,7 @@ int Launcher::automaticMerge() {
     auto startTime = std::chrono::steady_clock::now();
 
     // For a single set, run sequentially (no thread overhead)
-    if (optionsSet.size() <= 1) {
+    if (optionsSet.size() <= 1 || maxJobs <= 1) {
         ImageIO io;
         int result = 0;
         for (LoadOptions & options : optionsSet) {
@@ -586,7 +586,7 @@ void Launcher::showHelp() {
     cout << "    " << "--deghost-mode MODE " << tr("Deghost algorithm: 'legacy' (MAD) or 'robust' (reference-guided). Default: robust.") << endl;
     cout << "    " << "--deghost-iterations N " << tr("Refinement iterations for robust deghosting (1-5). Default: 1.") << endl;
     cout << "    " << "--clip-percentile P " << tr("Normalization percentile (90-100). Default 99.9. Use 100 for legacy behavior.") << endl;
-    cout << "    " << "-j N          " << tr("Number of concurrent merge jobs in batch mode. Default: half of CPU cores.") << endl;
+    cout << "    " << "-j N          " << tr("Number of concurrent merge jobs in batch mode. Use -j 1 for sequential processing (each job gets all CPU cores). Default: half of CPU cores.") << endl;
     cout << "    " << "-L PROFILE    " << tr("Apply ACR/Lightroom .xmp preset to output DNGs. Overrides default_profile.xmp.") << endl;
     cout << "    " << "              " << tr("If default_profile.xmp exists next to the hdrmerge binary, it is used automatically.") << endl;
     cout << "    " << "--auto-curves " << tr("Generate per-image adaptive RGB tone curves via ONNX model.") << endl;
