@@ -42,7 +42,16 @@ static void copyIPTC(Exiv2::Image & src, Exiv2::Image & dst);
 static void copyEXIF(Exiv2::Image & src, Exiv2::Image & dst);
 static void synthesizeLensXMP(Exiv2::Image & src, Exiv2::Image & dst);
 
+static void registerXmpNamespaces() {
+    static bool registered = false;
+    if (registered) return;
+    Exiv2::XmpProperties::registerNs("http://ns.adobe.com/exif/1.0/aux/", "aux");
+    Exiv2::XmpProperties::registerNs("http://cipa.jp/exif/1.0/", "exifEX");
+    registered = true;
+}
+
 static void copyAllMetadata(ExivImagePtr & src, ExivImagePtr & dst) {
+    registerXmpNamespaces();
     copyXMP(*src, *dst);
     copyIPTC(*src, *dst);
     copyEXIF(*src, *dst);
