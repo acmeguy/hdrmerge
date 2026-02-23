@@ -56,6 +56,7 @@ https://github.com/acmeguy/hdrmerge/issues
   - **DNG writer**: Streaming tile-based DNG writer to reduce peak memory usage. Refactored ExifTransfer with file-based `transferFile()`. Dual-illuminant passthrough. AsShotNeutral metadata.
   - **Compression**: libdeflate for DNG tile compression. zlib-ng with NEON-optimized DEFLATE. JXL compression support. Configurable compression level (`-c 1..12`).
   - **ARM NEON**: Vectorized fattenMask, boxBlurT, and float-to-half conversion for Apple Silicon.
+  - **Batch grouping**: Two-phase bracket detection — first groups images by time gap (`--batch-gap`, default 2s), then subdivides by EV pattern (detects repeated exposure values to split consecutive bracket sets). Output directory support (`-O DIR`, defaults to `merged/` subfolder).
   - **CLI**: Directory scanning (`-d DIR`) with auto-detection of directory arguments. Wall-clock timing output. Hot pixel correction (`--hot-pixel-sigma`). Resizer options. ACR profile embedding. Adaptive curves (with optional ONNX Runtime). Default bps changed from 16 to 32 to preserve full 14-bit sensor data.
   - **Internals**: Replaced 256-entry popcount LUT with `__builtin_popcount()`. `-march=native` for Release builds.
   - **Bug fixes**: Fixed black/pink dot artifacts from unbounded variance weight in shadow merge. Deghost allocation fix.
