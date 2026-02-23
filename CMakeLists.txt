@@ -402,6 +402,13 @@ if(WIN32)
 elseif(APPLE)
     set_source_files_properties(data/images/icon.icns PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
     install(TARGETS hdrmerge BUNDLE DESTINATION ${CMAKE_INSTALL_BINDIR})
+    # Copy default ACR profile next to the binary so it auto-loads
+    add_custom_command(TARGET hdrmerge POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/ref/default_profile.xmp"
+            "$<TARGET_BUNDLE_DIR:hdrmerge>/Contents/MacOS/default_profile.xmp"
+        COMMENT "Copying default_profile.xmp into app bundle"
+    )
     # Bundle libjxl and its transitive dependencies into the .app
     if(LIBJXL_LIBRARY AND LIBJXL_INCLUDE_DIR)
         set(BUNDLE_FW "$<TARGET_BUNDLE_DIR:hdrmerge>/Contents/Frameworks")
