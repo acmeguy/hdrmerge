@@ -2073,6 +2073,18 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         }
     }
 
+    // When highlight pull is active, normalize to maxVal so all compressed
+    // highlights fit within the DNG white level (no hard clamp).  Without
+    // this, values between normVal and maxVal get clamped to white —
+    // destroying the window detail we just recovered.
+    // BaselineExposure (computed from median luminance below) compensates
+    // so the interior still renders at the correct brightness.
+    if (doHighlightPull && maxVal > normVal) {
+        Log::debug("Highlight pull: adjusting normalization from ", normVal,
+                   " to maxVal=", maxVal, " to preserve compressed highlights");
+        normVal = maxVal;
+    }
+
     // Scale to params.max and recover the black levels
     float mult = (params.max - params.maxBlack) / normVal;
     float clampMax = static_cast<float>(params.max - params.maxBlack);
