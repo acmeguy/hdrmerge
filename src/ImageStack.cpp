@@ -1753,8 +1753,9 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
 
                     float m = 0.0f;
                     if (maxB > otsuThreshold) {
-                        m = static_cast<float>((maxB - otsuThreshold) * invRange);
-                        if (m > 1.0f) m = 1.0f;
+                        float t = static_cast<float>((maxB - otsuThreshold) * invRange);
+                        if (t > 1.0f) t = 1.0f;
+                        m = t * t * (3.0f - 2.0f * t);  // smoothstep: C1-continuous at endpoints
                         coreCount += 4;
                     }
 
