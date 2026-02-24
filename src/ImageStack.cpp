@@ -2002,37 +2002,12 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
             double v;
             if (totalWeight > 0.0) {
                 v = weightedSum / totalWeight;
-                // Highlight radiance compression: tight Reinhard clamp.
-                // headroom = (1-s)/s controls ceiling above refLevel.
-                // pull=0.8, mask=1.0 → headroom=0.25 → ceiling 1.25x ref
-                // (only ~0.3 stops above threshold — fully SDR).
-                if (hlMask > 0.0f) {
-                    double refLevel = hlThreshold * satThreshPerCh[ch];
-                    if (v > refLevel && refLevel > 0.0) {
-                        double s = static_cast<double>(highlightPull) * hlMask;
-                        double headroom = (1.0 - s) / std::max(s, 0.01);
-                        double excess = (v - refLevel) / refLevel;
-                        double compressed = headroom * excess / (headroom + excess);
-                        v = refLevel * (1.0 + compressed);
-                    }
-                }
             } else {
                 // All exposures saturated or unavailable — use darkest image.
                 if (images[imageMax].contains(x, y)) {
                     v = images[imageMax].exposureAt(x, y);
                 } else {
                     v = 0.0;
-                }
-                // Apply same compression to fallback pixels in highlight regions.
-                if (hlMask > 0.0f && v > 0.0) {
-                    double refLevel = hlThreshold * satThreshPerCh[ch];
-                    if (v > refLevel && refLevel > 0.0) {
-                        double s = static_cast<double>(highlightPull) * hlMask;
-                        double headroom = (1.0 - s) / std::max(s, 0.01);
-                        double excess = (v - refLevel) / refLevel;
-                        double compressed = headroom * excess / (headroom + excess);
-                        v = refLevel * (1.0 + compressed);
-                    }
                 }
             }
 
@@ -2073,18 +2048,6 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         }
     }
 
-    // When highlight pull is active, normalize to maxVal so all compressed
-    // highlights fit within the DNG white level (no hard clamp).  Without
-    // this, values between normVal and maxVal get clamped to white —
-    // destroying the window detail we just recovered.
-    // BaselineExposure (computed from median luminance below) compensates
-    // so the interior still renders at the correct brightness.
-    if (doHighlightPull && maxVal > normVal) {
-        Log::debug("Highlight pull: adjusting normalization from ", normVal,
-                   " to maxVal=", maxVal, " to preserve compressed highlights");
-        normVal = maxVal;
-    }
-
     // Scale to params.max and recover the black levels
     float mult = (params.max - params.maxBlack) / normVal;
     float clampMax = static_cast<float>(params.max - params.maxBlack);
@@ -2095,6 +2058,29 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
             if (v > clampMax) v = clampMax;
             dst(x, y) = v + params.blackAt(x - params.leftMargin, y - params.topMargin);
         }
+    }
+
+    // Post-normalization highlight pull: scale down DNG values in highlight
+    // regions.  This happens AFTER normalization so the scaling is final —
+    // it can't be undone.  Highlights at the white level get pulled down to
+    // (1 - pull * mask) * whiteLevel, making them visible in SDR.
+    // Channel-neutral: same scale factor for all CFA channels at a given
+    // pixel, so no color shift.
+    if (doHighlightPull && highlightMask.size() > 0) {
+        #pragma omp parallel for schedule(dynamic, 16)
+        for (size_t y = params.topMargin; y < params.topMargin + params.height; ++y) {
+            for (size_t x = params.leftMargin; x < params.leftMargin + params.width; ++x) {
+                float hlMask = highlightMask(x - params.leftMargin, y - params.topMargin);
+                if (hlMask > 0.0f) {
+                    float black = params.blackAt(x - params.leftMargin, y - params.topMargin);
+                    float signal = dst(x, y) - black;
+                    float scale = 1.0f - highlightPull * hlMask;
+                    dst(x, y) = signal * scale + black;
+                }
+            }
+        }
+        Log::debug("Post-normalization highlight pull applied (pull=",
+                   highlightPull, ")");
     }
 
     // Compute BaselineExposure from median of log-luminance (robust to HDR skew)
