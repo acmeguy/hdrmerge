@@ -2002,17 +2002,18 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
             double v;
             if (totalWeight > 0.0) {
                 v = weightedSum / totalWeight;
-                // Highlight radiance compression: power-curve compression
-                // in highlight regions.  Values above refLevel are compressed
-                // via v = refLevel * (v/refLevel)^gamma, where gamma < 1.
-                // This squashes extreme highlights (10-20x) into a narrow
-                // band that Lightroom can recover, while barely touching
-                // moderate highlights.
+                // Highlight radiance compression: Reinhard soft clamp.
+                // Maps [refLevel, inf) into [refLevel, refLevel*(1+1/s)]
+                // where s = pull * mask.  With pull=0.8, mask=1.0 the
+                // asymptote is 2.25x refLevel (~1.2 stops), well within
+                // SDR range and Lightroom's highlight slider.
                 if (hlMask > 0.0f) {
                     double refLevel = hlThreshold * satThreshPerCh[ch];
                     if (v > refLevel && refLevel > 0.0) {
-                        double gamma = 1.0 - static_cast<double>(highlightPull) * hlMask;
-                        v = refLevel * std::pow(v / refLevel, gamma);
+                        double s = static_cast<double>(highlightPull) * hlMask;
+                        double excess = (v - refLevel) / refLevel;
+                        double compressed = excess / (1.0 + s * excess);
+                        v = refLevel * (1.0 + compressed);
                     }
                 }
             } else {
