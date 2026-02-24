@@ -2160,11 +2160,16 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
     // scale. This preserves window mullions, exterior scene detail, and surface
     // texture while compressing the large-scale brightness envelope into SDR range.
     if (doHighlightPull && highlightMask.size() > 0) {
-        float sdrCeiling = clampMax * std::pow(2.0f, -static_cast<float>(baselineExposureEV));
+        // Compute average white-balance multiplier across the 4 CFA positions
+        // so the SDR ceiling matches the WB-corrected luminance domain.
+        float avgWBMul = 0.25f * (params.camMul[0] + params.camMul[1]
+                                 + params.camMul[2] + params.camMul[3]);
+        float sdrCeiling = clampMax * std::pow(2.0f, -static_cast<float>(baselineExposureEV))
+                           * avgWBMul;
 
-        if (sdrCeiling < clampMax && sdrCeiling > 0.0f) {
+        if (sdrCeiling < clampMax * avgWBMul && sdrCeiling > 0.0f) {
             Log::debug("Bilateral highlight compression: sdrCeiling=", sdrCeiling,
-                       " clampMax=", clampMax);
+                       " clampMax=", clampMax, " avgWBMul=", avgWBMul);
 
             // Step A: Half-resolution log-luminance map from 2x2 Bayer blocks
             const int bw = static_cast<int>(params.width) / 2;
@@ -2182,6 +2187,11 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                             float v = dst(px + dx, py + dy)
                                       - params.blackAt(bx * 2 + dx, by * 2 + dy);
                             if (v < 1.0f) v = 1.0f;
+                            // White-balance-correct so the bilateral filter sees true
+                            // scene luminance, not CFA-biased raw values.  Without this,
+                            // the uniform per-block scale introduces a color cast after
+                            // the DNG processor applies its own WB multipliers.
+                            v *= params.whiteMultAt(bx * 2 + dx, by * 2 + dy);
                             sum += v;
                         }
                     logLum(bx, by) = std::log(sum * 0.25f);
