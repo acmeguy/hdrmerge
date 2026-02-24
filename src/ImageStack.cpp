@@ -1378,7 +1378,7 @@ static inline double interpolateCFA(const Image & img, int x, int y,
 }
 
 
-ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, DeghostMode deghostMode, int deghostIterations, double clipPercentile, bool subPixelAlign, float highlightPull, float highlightRolloff, float highlightKnee, float bilateralRangeSigma, int highlightMaskBlur, int highlightScaleBlur, float highlightBoostCap) const {
+ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, DeghostMode deghostMode, int deghostIterations, double clipPercentile, bool subPixelAlign, float highlightPull, float highlightRolloff) const {
     int imageMax = images.size() - 1;
     BoxBlur map(fattenMask(mask, featherRadius));
     measureTime("Blur", [&] () {
@@ -1753,9 +1753,8 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
 
                     float m = 0.0f;
                     if (maxB > otsuThreshold) {
-                        float t = static_cast<float>((maxB - otsuThreshold) * invRange);
-                        if (t > 1.0f) t = 1.0f;
-                        m = t * t * (3.0f - 2.0f * t);  // smoothstep: C1-continuous at endpoints
+                        m = static_cast<float>((maxB - otsuThreshold) * invRange);
+                        if (m > 1.0f) m = 1.0f;
                         coreCount += 4;
                     }
 
@@ -2061,29 +2060,15 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         }
     }
 
-    // Scale to params.max and recover the black levels.
-    // Clamp highlights per 2x2 Bayer block to preserve CFA channel ratios;
-    // independent per-pixel clamping destroys color balance in saturated
-    // regions (all channels → same clampMax → magenta after WB).
+    // Scale to params.max and recover the black levels
     float mult = (params.max - params.maxBlack) / normVal;
     float clampMax = static_cast<float>(params.max - params.maxBlack);
     #pragma omp parallel for
-    for (size_t y = 0; y < params.rawHeight; y += 2) {
-        for (size_t x = 0; x < params.rawWidth; x += 2) {
-            float sigs[2][2] = {};
-            float maxSig = 0.0f;
-            for (int dy = 0; dy < 2 && y + dy < params.rawHeight; ++dy)
-                for (int dx = 0; dx < 2 && x + dx < params.rawWidth; ++dx) {
-                    float v = dst(x + dx, y + dy) * mult;
-                    sigs[dy][dx] = v;
-                    if (v > maxSig) maxSig = v;
-                }
-            float blockScale = (maxSig > clampMax) ? clampMax / maxSig : 1.0f;
-            for (int dy = 0; dy < 2 && y + dy < params.rawHeight; ++dy)
-                for (int dx = 0; dx < 2 && x + dx < params.rawWidth; ++dx)
-                    dst(x + dx, y + dy) = sigs[dy][dx] * blockScale
-                        + params.blackAt(x + dx - params.leftMargin,
-                                         y + dy - params.topMargin);
+    for (size_t y = 0; y < params.rawHeight; ++y) {
+        for (size_t x = 0; x < params.rawWidth; ++x) {
+            float v = dst(x, y) * mult;
+            if (v > clampMax) v = clampMax;
+            dst(x, y) = v + params.blackAt(x - params.leftMargin, y - params.topMargin);
         }
     }
 
@@ -2167,376 +2152,46 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                " normVal=", normVal, " maxVal=", maxVal,
                " BaselineExposure=", baselineExposureEV, " EV");
 
-    // Bilateral base-detail highlight compression.
-    // Decompose half-res log-luminance into base (smooth brightness) and detail
-    // (texture/edges) using a bilateral filter. Compress only the base layer with
-    // a Reinhard extended shoulder, then reconstruct by applying a uniform per-block
-    // scale. This preserves window mullions, exterior scene detail, and surface
-    // texture while compressing the large-scale brightness envelope into SDR range.
+    // SDR-aware post-normalization highlight pull.
+    // In Lightroom SDR mode, a DNG signal `s` renders as:
+    //   sdrRendered = (s / whiteLevel) * 2^BaselineExposure
+    // For SDR visibility we need sdrRendered < 1.0, i.e. s < whiteLevel * 2^(-BE).
+    // We target 100% of this ceiling — highlights land right at SDR white.
+    // The default profile's Highlights2012="-95" then brings them into visible
+    // range. This keeps HDR rendering less dark than a lower target would.
+    // Power interpolation (scale = sdrScale^epm) operates in log-space so that
+    // pull=0.8 with quadratic ease-in compresses ~96% of the way to the target.
+    // Channel-neutral: 2x2 block mask ensures same scale for all CFA channels.
     if (doHighlightPull && highlightMask.size() > 0) {
-        // Compute average white-balance multiplier across the 4 CFA positions
-        // so the SDR ceiling matches the WB-corrected luminance domain.
-        float avgWBMul = 0.25f * (params.camMul[0] + params.camMul[1]
-                                 + params.camMul[2] + params.camMul[3]);
-        float sdrCeiling = clampMax * std::pow(2.0f, -static_cast<float>(baselineExposureEV))
-                           * avgWBMul;
+        float sdrCeiling = clampMax * std::pow(2.0f, -static_cast<float>(baselineExposureEV));
+        float sdrTarget = sdrCeiling;
+        float sdrScale = (clampMax > 0.0f) ? sdrTarget / clampMax : 1.0f;
 
-        if (sdrCeiling < clampMax * avgWBMul && sdrCeiling > 0.0f) {
-            Log::debug("Bilateral highlight compression: sdrCeiling=", sdrCeiling,
-                       " clampMax=", clampMax, " avgWBMul=", avgWBMul,
-                       " knee=", highlightKnee);
-
-            // Step A: Half-resolution log-luminance map from 2x2 Bayer blocks
-            const int bw = static_cast<int>(params.width) / 2;
-            const int bh = static_cast<int>(params.height) / 2;
-
-            Array2D<float> logLum(bw, bh);
-            #pragma omp parallel for schedule(dynamic, 16)
-            for (int by = 0; by < bh; ++by) {
-                for (int bx = 0; bx < bw; ++bx) {
-                    int px = static_cast<int>(params.leftMargin) + bx * 2;
-                    int py = static_cast<int>(params.topMargin) + by * 2;
-                    float sum = 0.0f;
-                    for (int dy = 0; dy < 2; ++dy)
-                        for (int dx = 0; dx < 2; ++dx) {
-                            float v = dst(px + dx, py + dy)
-                                      - params.blackAt(bx * 2 + dx, by * 2 + dy);
-                            if (v < 1.0f) v = 1.0f;
-                            // White-balance-correct so the bilateral filter sees true
-                            // scene luminance, not CFA-biased raw values.  Without this,
-                            // the uniform per-block scale introduces a color cast after
-                            // the DNG processor applies its own WB multipliers.
-                            v *= params.whiteMultAt(bx * 2 + dx, by * 2 + dy);
-                            sum += v;
-                        }
-                    logLum(bx, by) = std::log(sum * 0.25f);
-                }
-            }
-
-            // Step B: Bilateral filter on log-luminance → base layer
-            const int spatialSigma = std::max(featherRadius, 8);
-            const float rangeSigma = bilateralRangeSigma;
-            const int bilateralR = static_cast<int>(std::ceil(2.0f * spatialSigma));
-            const float invRangeSigma2 = 1.0f / (2.0f * rangeSigma * rangeSigma);
-            const float invSpatialSigma2 = 1.0f / (2.0f * spatialSigma * spatialSigma);
-
-            // Pre-compute spatial Gaussian kernel
-            const int kernelSize = 2 * bilateralR + 1;
-            std::vector<float> spatialKernel(kernelSize * kernelSize);
-            for (int ky = -bilateralR; ky <= bilateralR; ++ky) {
-                for (int kx = -bilateralR; kx <= bilateralR; ++kx) {
-                    float d2 = static_cast<float>(kx * kx + ky * ky);
-                    spatialKernel[(ky + bilateralR) * kernelSize + (kx + bilateralR)] =
-                        std::exp(-d2 * invSpatialSigma2);
-                }
-            }
-
-            Array2D<float> logBase(bw, bh);
-            {
-                Timer t("Bilateral filter");
-                #pragma omp parallel for schedule(dynamic, 4)
-                for (int by = 0; by < bh; ++by) {
-                    for (int bx = 0; bx < bw; ++bx) {
-                        float center = logLum(bx, by);
-                        float wSum = 0.0f;
-                        float vSum = 0.0f;
-
-                        for (int ky = -bilateralR; ky <= bilateralR; ++ky) {
-                            // Mirror boundary for y
-                            int ny = by + ky;
-                            if (ny < 0) ny = -ny;
-                            if (ny >= bh) ny = 2 * bh - 2 - ny;
-
-                            for (int kx = -bilateralR; kx <= bilateralR; ++kx) {
-                                // Mirror boundary for x
-                                int nx = bx + kx;
-                                if (nx < 0) nx = -nx;
-                                if (nx >= bw) nx = 2 * bw - 2 - nx;
-
-                                float val = logLum(nx, ny);
-                                float spatW = spatialKernel[(ky + bilateralR) * kernelSize
-                                                            + (kx + bilateralR)];
-                                float diff = val - center;
-                                float rangeW = std::exp(-diff * diff * invRangeSigma2);
-                                float w = spatW * rangeW;
-                                wSum += w;
-                                vSum += w * val;
-                            }
-                        }
-
-                        logBase(bx, by) = (wSum > 0.0f) ? vSum / wSum : center;
-                    }
-                }
-            }
-
-            // Step C: Compress base layer + reconstruct
-            // Reinhard extended: L_compressed = L * (1 + L/Lw²) / (1 + L/Lw)
-            // highlightKnee scales Lw for gentler compression (higher = gentler)
-            const float Lw = sdrCeiling * highlightKnee;
-            const float Lw2 = Lw * Lw;
-
-            // Wide compression mask: the merge feather (6px) is too narrow
-            // for the large brightness changes that compression introduces,
-            // creating visible white edges at window borders.  Re-blur the
-            // highlight mask into a much wider transition zone so the scale
-            // graduates invisibly over ~80 full-res pixels.
-            Array2D<float> compMask(bw, bh);
-            #pragma omp parallel for schedule(dynamic, 16)
-            for (int by = 0; by < bh; ++by)
-                for (int bx = 0; bx < bw; ++bx)
-                    compMask(bx, by) = highlightMask(bx * 2, by * 2);
-
-            // Outward feather: dilate compMask by highlightScaleBlur blocks
-            // (3x3 max filter), then blur to create a smooth falloff past
-            // the original boundary.  This extends compression slightly
-            // beyond the highlight edge, hiding the visible transition.
-            if (highlightScaleBlur > 0) {
-                // Save original mask to preserve interior strength
-                Array2D<float> origMask(bw, bh);
-                #pragma omp parallel for
-                for (int i = 0; i < bw * bh; ++i)
-                    origMask[i] = compMask[i];
-
-                // Dilate: N passes of 3x3 max filter
-                for (int pass = 0; pass < highlightScaleBlur; ++pass) {
-                    Array2D<float> tmp(bw, bh);
-                    #pragma omp parallel for schedule(dynamic, 16)
-                    for (int by = 0; by < bh; ++by) {
-                        for (int bx = 0; bx < bw; ++bx) {
-                            float maxVal = compMask(bx, by);
-                            for (int ky = -1; ky <= 1; ++ky)
-                                for (int kx = -1; kx <= 1; ++kx) {
-                                    int nx = bx + kx, ny = by + ky;
-                                    if (nx < 0) nx = 0;
-                                    if (nx >= bw) nx = bw - 1;
-                                    if (ny < 0) ny = 0;
-                                    if (ny >= bh) ny = bh - 1;
-                                    float v = compMask(nx, ny);
-                                    if (v > maxVal) maxVal = v;
-                                }
-                            tmp(bx, by) = maxVal;
-                        }
-                    }
-                    #pragma omp parallel for
-                    for (int i = 0; i < bw * bh; ++i)
-                        compMask[i] = tmp[i];
-                }
-
-                // Blur the dilated mask to create smooth falloff
-                for (int pass = 0; pass < highlightScaleBlur; ++pass) {
-                    Array2D<float> tmp(bw, bh);
-                    #pragma omp parallel for schedule(dynamic, 16)
-                    for (int by = 0; by < bh; ++by) {
-                        for (int bx = 0; bx < bw; ++bx) {
-                            float sum = 0.0f;
-                            int count = 0;
-                            for (int kx = -2; kx <= 2; ++kx) {
-                                int nx = bx + kx;
-                                if (nx < 0) nx = -nx;
-                                if (nx >= bw) nx = 2 * bw - 2 - nx;
-                                sum += compMask(nx, by);
-                                ++count;
-                            }
-                            tmp(bx, by) = sum / count;
-                        }
-                    }
-                    #pragma omp parallel for schedule(dynamic, 16)
-                    for (int by = 0; by < bh; ++by) {
-                        for (int bx = 0; bx < bw; ++bx) {
-                            float sum = 0.0f;
-                            int count = 0;
-                            for (int ky = -2; ky <= 2; ++ky) {
-                                int ny = by + ky;
-                                if (ny < 0) ny = -ny;
-                                if (ny >= bh) ny = 2 * bh - 2 - ny;
-                                sum += tmp(bx, ny);
-                                ++count;
-                            }
-                            compMask(bx, by) = sum / count;
-                        }
-                    }
-                }
-
-                // Restore original interior: dilate+blur may have reduced
-                // interior values, so take the max of original and dilated
-                #pragma omp parallel for
-                for (int i = 0; i < bw * bh; ++i)
-                    if (origMask[i] > compMask[i])
-                        compMask[i] = origMask[i];
-            }
-
-            for (int pass = 0; pass < highlightMaskBlur; ++pass) {
-                Array2D<float> tmp(bw, bh);
-                #pragma omp parallel for schedule(dynamic, 16)
-                for (int by = 0; by < bh; ++by) {
-                    for (int bx = 0; bx < bw; ++bx) {
-                        float sum = 0.0f;
-                        int count = 0;
-                        for (int kx = -2; kx <= 2; ++kx) {
-                            int nx = bx + kx;
-                            if (nx < 0) nx = -nx;
-                            if (nx >= bw) nx = 2 * bw - 2 - nx;
-                            sum += compMask(nx, by);
-                            ++count;
-                        }
-                        tmp(bx, by) = sum / count;
-                    }
-                }
-                #pragma omp parallel for schedule(dynamic, 16)
-                for (int by = 0; by < bh; ++by) {
-                    for (int bx = 0; bx < bw; ++bx) {
-                        float sum = 0.0f;
-                        int count = 0;
-                        for (int ky = -2; ky <= 2; ++ky) {
-                            int ny = by + ky;
-                            if (ny < 0) ny = -ny;
-                            if (ny >= bh) ny = 2 * bh - 2 - ny;
-                            sum += tmp(bx, ny);
-                            ++count;
-                        }
-                        compMask(bx, by) = sum / count;
-                    }
-                }
-            }
-
-            // Phase 1: Compute per-block scale factors using wide compMask
-            Array2D<float> scaleMap(bw, bh);
-            #pragma omp parallel for
-            for (int i = 0; i < bw * bh; ++i)
-                scaleMap[i] = 1.0f;
+        if (sdrScale < 1.0f && sdrScale > 0.0f) {
+            Log::debug("SDR-aware pull: sdrCeiling=", sdrCeiling,
+                       " sdrTarget=", sdrTarget,
+                       " sdrScale=", sdrScale);
 
             #pragma omp parallel for schedule(dynamic, 16)
-            for (int by = 0; by < bh; ++by) {
-                for (int bx = 0; bx < bw; ++bx) {
-                    float cm = compMask(bx, by);
-                    if (cm <= 0.0f) continue;
-
-                    float L = std::exp(logBase(bx, by));
-                    float L_compressed = L * (1.0f + L / Lw2) / (1.0f + L / Lw);
-                    float pm = highlightPull * cm;
-                    float epm = 1.0f - (1.0f - pm) * (1.0f - pm);
-                    float L_final = L + (L_compressed - L) * epm;
-                    float scale = (L > 0.01f) ? L_final / L : 1.0f;
-                    if (scale < 0.1f) scale = 0.1f;
-                    if (scale > 1.0f) scale = 1.0f;
-                    scaleMap(bx, by) = scale;
-                }
-            }
-
-            // Phase 3: Apply via base-detail reconstruction.
-            // Split each pixel into detail (ratio to block mean) and base
-            // (bilateral-smoothed luminance), then reconstruct with the
-            // compressed base.  If a block has anomalous luminance (e.g.
-            // dark-exposure data bleeding through the merge), the bilateral
-            // base provides the correct regional luminance, and the detail
-            // layer captures per-pixel color structure.  The "boost" factor
-            // (baseLum / blockLum) automatically corrects these blocks.
-            long long compressedBlocks = 0;
-            #pragma omp parallel for schedule(dynamic, 16) reduction(+:compressedBlocks)
-            for (int by = 0; by < bh; ++by) {
-                for (int bx = 0; bx < bw; ++bx) {
-                    float scale = scaleMap(bx, by);
-                    if (scale >= 0.999f) continue;
-
-                    int ax = bx * 2;
-                    int ay = by * 2;
-                    int px = static_cast<int>(params.leftMargin) + ax;
-                    int py = static_cast<int>(params.topMargin) + ay;
-
-                    // Base-detail: correct anomalous block luminance
-                    float blockLum = std::exp(logLum(bx, by));
-                    float baseLum = std::exp(logBase(bx, by));
-                    float boost = 1.0f;
-                    if (highlightBoostCap > 0.0f && blockLum > 0.01f) {
-                        boost = baseLum / blockLum;
-                        if (boost > highlightBoostCap) boost = highlightBoostCap;
-                        if (boost < 1.0f / highlightBoostCap) boost = 1.0f / highlightBoostCap;
-                    }
-
-                    // Desaturation: use baseLum for consistent saturation
-                    // estimate across regions (not affected by bleed-through)
-                    float wbClampMax = clampMax * avgWBMul;
-                    float satRatio = baseLum / wbClampMax;
-                    if (satRatio > 1.0f) satRatio = 1.0f;
-                    float desatT = (satRatio < 0.5f) ? 0.0f : (satRatio - 0.5f) * 2.0f;
-                    float cm = compMask(bx, by);
-                    float pm = highlightPull * cm;
-                    float epm = 1.0f - (1.0f - pm) * (1.0f - pm);
-                    float desat = desatT * desatT * (3.0f - 2.0f * desatT) * epm;
-
-                    float L_final = baseLum * scale;
-
-                    for (int dy = 0; dy < 2; ++dy)
-                        for (int dx = 0; dx < 2; ++dx) {
-                            float black = params.blackAt(ax + dx, ay + dy);
-                            float signal = dst(px + dx, py + dy) - black;
-                            float scaled = signal * boost * scale;
-                            if (desat > 0.0f) {
-                                float wb = params.whiteMultAt(ax + dx, ay + dy);
-                                float neutral = L_final / wb;
-                                scaled = scaled + (neutral - scaled) * desat;
-                            }
-                            dst(px + dx, py + dy) = scaled + black;
-                        }
-                    ++compressedBlocks;
-                }
-            }
-
-            // Diagnostic: analyze boost distribution and find gray-blob clusters
-            {
-                int boostLow = 0, boostHigh = 0, boostNeutral = 0;
-                float minBoostRatio = 999.0f, maxBoostRatio = 0.0f;
-                float minScale = 1.0f;
-                int lowLumBlocks = 0;
-                // Track worst outlier positions (baseLum >> blockLum = gray blob)
-                struct Outlier { int bx, by; float ratio, blockLum, baseLum, scale; };
-                std::vector<Outlier> outliers;
-                for (int by = 0; by < bh; ++by) {
-                    for (int bx = 0; bx < bw; ++bx) {
-                        if (scaleMap(bx, by) >= 0.999f) continue;
-                        float blockLum = std::exp(logLum(bx, by));
-                        float baseLum = std::exp(logBase(bx, by));
-                        float ratio = (blockLum > 0.01f) ? baseLum / blockLum : 1.0f;
-                        if (ratio < 0.8f) boostLow++;
-                        else if (ratio > 1.2f) boostHigh++;
-                        else boostNeutral++;
-                        if (ratio < minBoostRatio) minBoostRatio = ratio;
-                        if (ratio > maxBoostRatio) maxBoostRatio = ratio;
-                        if (scaleMap(bx, by) < minScale) minScale = scaleMap(bx, by);
-                        if (ratio > 2.0f) lowLumBlocks++;
-                        if (ratio > 1.5f) {
-                            outliers.push_back({bx, by, ratio, blockLum, baseLum, scaleMap(bx, by)});
+            for (size_t y = params.topMargin; y < params.topMargin + params.height; ++y) {
+                for (size_t x = params.leftMargin; x < params.leftMargin + params.width; ++x) {
+                    float hlMask = highlightMask(x - params.leftMargin, y - params.topMargin);
+                    if (hlMask > 0.0f) {
+                        float black = params.blackAt(x - params.leftMargin, y - params.topMargin);
+                        float signal = dst(x, y) - black;
+                        if (signal > 0.0f) {
+                            float pm = highlightPull * hlMask;
+                            float epm = 1.0f - (1.0f - pm) * (1.0f - pm);
+                            float scale = std::pow(sdrScale, epm);
+                            dst(x, y) = signal * scale + black;
                         }
                     }
                 }
-                Log::debug("Boost diagnostic: low(<0.8)=", boostLow,
-                           " neutral=", boostNeutral,
-                           " high(>1.2)=", boostHigh,
-                           " anomalous(>2x)=", lowLumBlocks,
-                           " outliers(>1.5x)=", outliers.size(),
-                           " range=[", minBoostRatio, ", ", maxBoostRatio, "]",
-                           " minScale=", minScale);
-                // Log the top 20 worst outliers
-                std::sort(outliers.begin(), outliers.end(),
-                    [](const Outlier& a, const Outlier& b) { return a.ratio > b.ratio; });
-                int nShow = std::min((int)outliers.size(), 20);
-                for (int i = 0; i < nShow; ++i) {
-                    auto& o = outliers[i];
-                    Log::debug("  outlier[", i, "] pixel=(", o.bx*2, ",", o.by*2,
-                               ") ratio=", o.ratio, " blockLum=", o.blockLum,
-                               " baseLum=", o.baseLum, " scale=", o.scale);
-                }
             }
-
-            Log::debug("Bilateral highlight compression: ", compressedBlocks,
-                       " blocks compressed (spatialSigma=", spatialSigma,
-                       " rangeSigma=", rangeSigma, " radius=", bilateralR,
-                       " maskBlur=", highlightMaskBlur,
-                       " scaleBlur=", highlightScaleBlur,
-                       " boostCap=", highlightBoostCap, ")");
+            Log::debug("Post-normalization SDR-aware highlight pull applied");
         } else {
-            Log::debug("Highlights already below SDR white (sdrCeiling=",
-                       sdrCeiling, "), skipping bilateral compression");
+            Log::debug("Highlights already below SDR white (sdrScale=",
+                       sdrScale, "), skipping pull");
         }
     }
 

@@ -553,71 +553,6 @@ void Launcher::parseCommandLine() {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
             }
-        } else if (string("--highlight-knee") == argv[i]) {
-            if (++i < argc) {
-                try {
-                    float val = stof(argv[i]);
-                    if (val >= 1.0f && val <= 10.0f) {
-                        saveOptions.highlightKnee = val;
-                    } else {
-                        cerr << tr("--highlight-knee must be between 1 and 10.") << endl;
-                    }
-                } catch (std::invalid_argument & e) {
-                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
-                }
-            }
-        } else if (string("--bilateral-range-sigma") == argv[i]) {
-            if (++i < argc) {
-                try {
-                    float val = stof(argv[i]);
-                    if (val >= 0.1f && val <= 2.0f) {
-                        saveOptions.bilateralRangeSigma = val;
-                    } else {
-                        cerr << tr("--bilateral-range-sigma must be between 0.1 and 2.0.") << endl;
-                    }
-                } catch (std::invalid_argument & e) {
-                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
-                }
-            }
-        } else if (string("--highlight-mask-blur") == argv[i]) {
-            if (++i < argc) {
-                try {
-                    int val = stoi(argv[i]);
-                    if (val >= 0 && val <= 30) {
-                        saveOptions.highlightMaskBlur = val;
-                    } else {
-                        cerr << tr("--highlight-mask-blur must be between 0 and 30.") << endl;
-                    }
-                } catch (std::invalid_argument & e) {
-                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
-                }
-            }
-        } else if (string("--highlight-scale-blur") == argv[i]) {
-            if (++i < argc) {
-                try {
-                    int val = stoi(argv[i]);
-                    if (val >= 0 && val <= 30) {
-                        saveOptions.highlightScaleBlur = val;
-                    } else {
-                        cerr << tr("--highlight-scale-blur must be between 0 and 30.") << endl;
-                    }
-                } catch (std::invalid_argument & e) {
-                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
-                }
-            }
-        } else if (string("--highlight-boost-cap") == argv[i]) {
-            if (++i < argc) {
-                try {
-                    float val = stof(argv[i]);
-                    if (val >= 0.0f && val <= 16.0f) {
-                        saveOptions.highlightBoostCap = val;
-                    } else {
-                        cerr << tr("--highlight-boost-cap must be between 0 and 16.") << endl;
-                    }
-                } catch (std::invalid_argument & e) {
-                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
-                }
-            }
         } else if (string("-O") == argv[i] || string("--output-dir") == argv[i]) {
             if (++i < argc) {
                 saveOptions.outputDir = QString::fromLocal8Bit(argv[i]);
@@ -729,7 +664,6 @@ void Launcher::showHelp() {
     cout << "    " << "--sub-pixel   " << tr("Apply sub-pixel alignment correction (experimental). Default off.") << endl;
     cout << "    " << "--highlight-pull S " << tr("Highlight pull strength [0, 1]. Compresses bright regions to recover window detail. 0=off (default).") << endl;
     cout << "    " << "--highlight-rolloff F " << tr("Rolloff start as fraction of saturation [0.5, 0.95]. Lower = earlier transition to shorter exposures. Default 0.9.") << endl;
-    cout << "    " << "--highlight-knee K " << tr("Compression knee [1, 10]. Higher = gentler highlight compression. Default 2.0.") << endl;
     cout << "    " << "-O|--output-dir DIR " << tr("Write output files to DIR instead of alongside inputs.") << endl;
     cout << "    " << "-d DIR        " << tr("Scan directory for raw files.") << endl;
     cout << "    " << "RAW_FILES     " << tr("The input raw files or directories containing raw files.") << endl;
@@ -781,8 +715,6 @@ bool Launcher::checkGUI() {
         } else if (string("--highlight-pull") == argv[i]) {
             ++i; // skip the value
         } else if (string("--highlight-rolloff") == argv[i]) {
-            ++i; // skip the value
-        } else if (string("--highlight-knee") == argv[i]) {
             ++i; // skip the value
         } else if (string("-O") == argv[i] || string("--output-dir") == argv[i]) {
             ++i; // skip the value

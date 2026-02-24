@@ -17,6 +17,7 @@
     crs:Whites2012="+10"
     crs:Vibrance="+20"
     crs:AutoLateralCA="1"
+    crs:PerspectiveUpright="1"
     crs:SaturationAdjustmentOrange="-20"
     crs:SaturationAdjustmentYellow="-20"
     crs:SaturationAdjustmentBlue="-15">
