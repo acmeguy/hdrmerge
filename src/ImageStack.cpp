@@ -1733,25 +1733,37 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
             hlThreshold = otsuThreshold;
             Log::debug("Effective highlight threshold: ", otsuThreshold);
 
-            // Phase 3: Build graduated core mask
-            // Mask is proportional to how far above threshold each pixel is.
-            // Fully saturated = 1.0, just above threshold = near-zero.
+            // Phase 3: Build graduated core mask at 2x2 Bayer block resolution.
+            // Using the MAX brightness in each 2x2 block ensures all CFA channels
+            // at the same spatial location get identical mask values, preventing
+            // color shifts from differential per-channel compression.
             double invRange = 1.0 / std::max(0.01, 1.0 - otsuThreshold);
             long long coreCount = 0;
             highlightMask = Array2D<float>(width, height);
 
             #pragma omp parallel for reduction(+:coreCount)
-            for (size_t y = 0; y < height; ++y) {
-                for (size_t x = 0; x < width; ++x) {
-                    float b = brightnessMap(x, y);
-                    if (b > otsuThreshold) {
-                        float m = static_cast<float>((b - otsuThreshold) * invRange);
+            for (size_t y = 0; y < height; y += 2) {
+                for (size_t x = 0; x < width; x += 2) {
+                    // Find max brightness across the 2x2 Bayer block
+                    float maxB = brightnessMap(x, y);
+                    if (x + 1 < width) maxB = std::max(maxB, brightnessMap(x + 1, y));
+                    if (y + 1 < height) maxB = std::max(maxB, brightnessMap(x, y + 1));
+                    if (x + 1 < width && y + 1 < height)
+                        maxB = std::max(maxB, brightnessMap(x + 1, y + 1));
+
+                    float m = 0.0f;
+                    if (maxB > otsuThreshold) {
+                        m = static_cast<float>((maxB - otsuThreshold) * invRange);
                         if (m > 1.0f) m = 1.0f;
-                        highlightMask(x, y) = m;
-                        coreCount++;
-                    } else {
-                        highlightMask(x, y) = 0.0f;
+                        coreCount += 4;
                     }
+
+                    // Apply uniform mask to all pixels in this block
+                    highlightMask(x, y) = m;
+                    if (x + 1 < width) highlightMask(x + 1, y) = m;
+                    if (y + 1 < height) highlightMask(x, y + 1) = m;
+                    if (x + 1 < width && y + 1 < height)
+                        highlightMask(x + 1, y + 1) = m;
                 }
             }
 
@@ -2144,14 +2156,15 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
     // In Lightroom SDR mode, a DNG signal `s` renders as:
     //   sdrRendered = (s / whiteLevel) * 2^BaselineExposure
     // For SDR visibility we need sdrRendered < 1.0, i.e. s < whiteLevel * 2^(-BE).
-    // We call that threshold the "SDR ceiling" and target 70% of it so that
-    // highlights land comfortably below SDR white.
+    // We target 100% of this ceiling — highlights land right at SDR white.
+    // The default profile's Highlights2012="-95" then brings them into visible
+    // range. This keeps HDR rendering less dark than a lower target would.
     // Power interpolation (scale = sdrScale^epm) operates in log-space so that
     // pull=0.8 with quadratic ease-in compresses ~96% of the way to the target.
-    // Channel-neutral: same scale for all CFA channels → no color shift.
+    // Channel-neutral: 2x2 block mask ensures same scale for all CFA channels.
     if (doHighlightPull && highlightMask.size() > 0) {
         float sdrCeiling = clampMax * std::pow(2.0f, -static_cast<float>(baselineExposureEV));
-        float sdrTarget = sdrCeiling * 0.7f;
+        float sdrTarget = sdrCeiling;
         float sdrScale = (clampMax > 0.0f) ? sdrTarget / clampMax : 1.0f;
 
         if (sdrScale < 1.0f && sdrScale > 0.0f) {
