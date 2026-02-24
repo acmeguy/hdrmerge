@@ -115,6 +115,23 @@ list<LoadOptions> Launcher::getBracketedSets() {
     }
     dateNames.sort();
 
+    // Remove dual-card-slot duplicates (same timestamp + same EV)
+    {
+        auto it = dateNames.begin();
+        while (it != dateNames.end()) {
+            auto next = std::next(it);
+            if (next != dateNames.end()
+                && it->first.start == next->first.start
+                && it->first.evThird() == next->first.evThird()) {
+                Log::progress("Skipping duplicate: ", next->second,
+                              " (same time+EV as ", it->second, ")");
+                dateNames.erase(next);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     // Phase 1: Group by time gap
     using DateName = pair<ImageIO::QDateInterval, QString>;
     list<list<DateName>> timeGroups;
@@ -214,9 +231,21 @@ int Launcher::automaticMerge() {
             }
             setOptions.fileName = applyOutputDir(setOptions.fileName, setOptions.outputDir);
             Log::progress(tr("Writing result to %1").arg(setOptions.fileName));
-            io.save(setOptions, progress);
+            double ghostScore = io.save(setOptions, progress);
             double setElapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - setStart).count();
-            Log::msg(Log::INFO, setOptions.fileName, "  ", setElapsed, "s");
+            Log::msg(Log::INFO, setOptions.fileName, "  ", setElapsed, "s  ghost=", ghostScore);
+
+            // Auto-reprocess with deghosting if ghost score exceeds threshold
+            const double ghostThreshold = 5.0;
+            const float autoDeghostSigma = 3.0f;
+            if (ghostScore > ghostThreshold && setOptions.deghostSigma <= 0.0f) {
+                Log::progress("Ghost score ", ghostScore, " > ", ghostThreshold,
+                              ", reprocessing with deghosting (sigma=", autoDeghostSigma, ")");
+                setOptions.deghostSigma = autoDeghostSigma;
+                double dgScore = io.save(setOptions, progress);
+                double dgElapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - setStart).count();
+                Log::msg(Log::INFO, setOptions.fileName, "  ", dgElapsed, "s  ghost=", dgScore, " (deghosted)");
+            }
         }
         double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
         Log::msg(Log::INFO, "Total processing time: ", elapsed, " seconds");
@@ -290,9 +319,21 @@ int Launcher::automaticMerge() {
                 }
                 setOptions.fileName = applyOutputDir(setOptions.fileName, setOptions.outputDir);
                 Log::progress(tr("Writing result to %1").arg(setOptions.fileName));
-                io.save(setOptions, progress);
+                double ghostScore = io.save(setOptions, progress);
                 double setElapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - setStart).count();
-                Log::msg(Log::INFO, setOptions.fileName, "  ", setElapsed, "s");
+                Log::msg(Log::INFO, setOptions.fileName, "  ", setElapsed, "s  ghost=", ghostScore);
+
+                // Auto-reprocess with deghosting if ghost score exceeds threshold
+                const double ghostThreshold = 5.0;
+                const float autoDeghostSigma = 3.0f;
+                if (ghostScore > ghostThreshold && setOptions.deghostSigma <= 0.0f) {
+                    Log::progress("Ghost score ", ghostScore, " > ", ghostThreshold,
+                                  ", reprocessing with deghosting (sigma=", autoDeghostSigma, ")");
+                    setOptions.deghostSigma = autoDeghostSigma;
+                    double dgScore = io.save(setOptions, progress);
+                    double dgElapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - setStart).count();
+                    Log::msg(Log::INFO, setOptions.fileName, "  ", dgElapsed, "s  ghost=", dgScore, " (deghosted)");
+                }
             }
 
             activeJobs--;
@@ -486,6 +527,32 @@ void Launcher::parseCommandLine() {
             }
         } else if (string("--sub-pixel") == argv[i]) {
             saveOptions.subPixelAlign = true;
+        } else if (string("--highlight-pull") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    float val = stof(argv[i]);
+                    if (val >= 0.0f && val <= 1.0f) {
+                        saveOptions.highlightPull = val;
+                    } else {
+                        cerr << tr("--highlight-pull must be between 0 and 1.") << endl;
+                    }
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
+        } else if (string("--highlight-rolloff") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    float val = stof(argv[i]);
+                    if (val >= 0.5f && val <= 0.95f) {
+                        saveOptions.highlightRolloff = val;
+                    } else {
+                        cerr << tr("--highlight-rolloff must be between 0.5 and 0.95.") << endl;
+                    }
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
         } else if (string("-O") == argv[i] || string("--output-dir") == argv[i]) {
             if (++i < argc) {
                 saveOptions.outputDir = QString::fromLocal8Bit(argv[i]);
@@ -595,6 +662,8 @@ void Launcher::showHelp() {
     cout << "    " << "--response-mode MODE " << tr("Response curve mode: 'linear' (default) or 'nonlinear'. Linear is optimal for RAW.") << endl;
     cout << "    " << "--hot-pixel S " << tr("Hot/dead pixel correction. S is the sigma threshold (e.g. 3.0). 0=off (default).") << endl;
     cout << "    " << "--sub-pixel   " << tr("Apply sub-pixel alignment correction (experimental). Default off.") << endl;
+    cout << "    " << "--highlight-pull S " << tr("Highlight pull strength [0, 1]. Compresses bright regions to recover window detail. 0=off (default).") << endl;
+    cout << "    " << "--highlight-rolloff F " << tr("Rolloff start as fraction of saturation [0.5, 0.95]. Lower = earlier transition to shorter exposures. Default 0.9.") << endl;
     cout << "    " << "-O|--output-dir DIR " << tr("Write output files to DIR instead of alongside inputs.") << endl;
     cout << "    " << "-d DIR        " << tr("Scan directory for raw files.") << endl;
     cout << "    " << "RAW_FILES     " << tr("The input raw files or directories containing raw files.") << endl;
@@ -643,6 +712,10 @@ bool Launcher::checkGUI() {
             ++i; // skip the value
         } else if (string("--sub-pixel") == argv[i]) {
             // flag only, no effect on GUI decision
+        } else if (string("--highlight-pull") == argv[i]) {
+            ++i; // skip the value
+        } else if (string("--highlight-rolloff") == argv[i]) {
+            ++i; // skip the value
         } else if (string("-O") == argv[i] || string("--output-dir") == argv[i]) {
             ++i; // skip the value
         } else if (string("-d") == argv[i]) {
