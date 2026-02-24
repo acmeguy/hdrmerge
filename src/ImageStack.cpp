@@ -2153,46 +2153,148 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                " normVal=", normVal, " maxVal=", maxVal,
                " BaselineExposure=", baselineExposureEV, " EV");
 
-    // SDR-aware post-normalization highlight pull.
-    // In Lightroom SDR mode, a DNG signal `s` renders as:
-    //   sdrRendered = (s / whiteLevel) * 2^BaselineExposure
-    // For SDR visibility we need sdrRendered < 1.0, i.e. s < whiteLevel * 2^(-BE).
-    // We target 100% of this ceiling — highlights land right at SDR white.
-    // The default profile's Highlights2012="-95" then brings them into visible
-    // range. This keeps HDR rendering less dark than a lower target would.
-    // Power interpolation (scale = sdrScale^epm) operates in log-space so that
-    // pull=0.8 with quadratic ease-in compresses ~96% of the way to the target.
-    // Channel-neutral: 2x2 block mask ensures same scale for all CFA channels.
+    // Bilateral base-detail highlight compression.
+    // Decompose half-res log-luminance into base (smooth brightness) and detail
+    // (texture/edges) using a bilateral filter. Compress only the base layer with
+    // a Reinhard extended shoulder, then reconstruct by applying a uniform per-block
+    // scale. This preserves window mullions, exterior scene detail, and surface
+    // texture while compressing the large-scale brightness envelope into SDR range.
     if (doHighlightPull && highlightMask.size() > 0) {
         float sdrCeiling = clampMax * std::pow(2.0f, -static_cast<float>(baselineExposureEV));
-        float sdrTarget = sdrCeiling;
-        float sdrScale = (clampMax > 0.0f) ? sdrTarget / clampMax : 1.0f;
 
-        if (sdrScale < 1.0f && sdrScale > 0.0f) {
-            Log::debug("SDR-aware pull: sdrCeiling=", sdrCeiling,
-                       " sdrTarget=", sdrTarget,
-                       " sdrScale=", sdrScale);
+        if (sdrCeiling < clampMax && sdrCeiling > 0.0f) {
+            Log::debug("Bilateral highlight compression: sdrCeiling=", sdrCeiling,
+                       " clampMax=", clampMax);
 
+            // Step A: Half-resolution log-luminance map from 2x2 Bayer blocks
+            const int bw = static_cast<int>(params.width) / 2;
+            const int bh = static_cast<int>(params.height) / 2;
+
+            Array2D<float> logLum(bw, bh);
             #pragma omp parallel for schedule(dynamic, 16)
-            for (size_t y = params.topMargin; y < params.topMargin + params.height; ++y) {
-                for (size_t x = params.leftMargin; x < params.leftMargin + params.width; ++x) {
-                    float hlMask = highlightMask(x - params.leftMargin, y - params.topMargin);
-                    if (hlMask > 0.0f) {
-                        float black = params.blackAt(x - params.leftMargin, y - params.topMargin);
-                        float signal = dst(x, y) - black;
-                        if (signal > 0.0f) {
-                            float pm = highlightPull * hlMask;
-                            float epm = 1.0f - (1.0f - pm) * (1.0f - pm);
-                            float scale = std::pow(sdrScale, epm);
-                            dst(x, y) = signal * scale + black;
+            for (int by = 0; by < bh; ++by) {
+                for (int bx = 0; bx < bw; ++bx) {
+                    int px = static_cast<int>(params.leftMargin) + bx * 2;
+                    int py = static_cast<int>(params.topMargin) + by * 2;
+                    float sum = 0.0f;
+                    for (int dy = 0; dy < 2; ++dy)
+                        for (int dx = 0; dx < 2; ++dx) {
+                            float v = dst(px + dx, py + dy)
+                                      - params.blackAt(bx * 2 + dx, by * 2 + dy);
+                            if (v < 1.0f) v = 1.0f;
+                            sum += v;
                         }
+                    logLum(bx, by) = std::log(sum * 0.25f);
+                }
+            }
+
+            // Step B: Bilateral filter on log-luminance → base layer
+            const int spatialSigma = std::max(featherRadius, 8);
+            const float rangeSigma = 0.4f;  // ~1.5 stops in log-space
+            const int bilateralR = static_cast<int>(std::ceil(2.0f * spatialSigma));
+            const float invRangeSigma2 = 1.0f / (2.0f * rangeSigma * rangeSigma);
+            const float invSpatialSigma2 = 1.0f / (2.0f * spatialSigma * spatialSigma);
+
+            // Pre-compute spatial Gaussian kernel
+            const int kernelSize = 2 * bilateralR + 1;
+            std::vector<float> spatialKernel(kernelSize * kernelSize);
+            for (int ky = -bilateralR; ky <= bilateralR; ++ky) {
+                for (int kx = -bilateralR; kx <= bilateralR; ++kx) {
+                    float d2 = static_cast<float>(kx * kx + ky * ky);
+                    spatialKernel[(ky + bilateralR) * kernelSize + (kx + bilateralR)] =
+                        std::exp(-d2 * invSpatialSigma2);
+                }
+            }
+
+            Array2D<float> logBase(bw, bh);
+            {
+                Timer t("Bilateral filter");
+                #pragma omp parallel for schedule(dynamic, 4)
+                for (int by = 0; by < bh; ++by) {
+                    for (int bx = 0; bx < bw; ++bx) {
+                        float center = logLum(bx, by);
+                        float wSum = 0.0f;
+                        float vSum = 0.0f;
+
+                        for (int ky = -bilateralR; ky <= bilateralR; ++ky) {
+                            // Mirror boundary for y
+                            int ny = by + ky;
+                            if (ny < 0) ny = -ny;
+                            if (ny >= bh) ny = 2 * bh - 2 - ny;
+
+                            for (int kx = -bilateralR; kx <= bilateralR; ++kx) {
+                                // Mirror boundary for x
+                                int nx = bx + kx;
+                                if (nx < 0) nx = -nx;
+                                if (nx >= bw) nx = 2 * bw - 2 - nx;
+
+                                float val = logLum(nx, ny);
+                                float spatW = spatialKernel[(ky + bilateralR) * kernelSize
+                                                            + (kx + bilateralR)];
+                                float diff = val - center;
+                                float rangeW = std::exp(-diff * diff * invRangeSigma2);
+                                float w = spatW * rangeW;
+                                wSum += w;
+                                vSum += w * val;
+                            }
+                        }
+
+                        logBase(bx, by) = (wSum > 0.0f) ? vSum / wSum : center;
                     }
                 }
             }
-            Log::debug("Post-normalization SDR-aware highlight pull applied");
+
+            // Step C: Compress base layer + reconstruct
+            // Reinhard extended: L_compressed = L * (1 + L/Lw²) / (1 + L)
+            // where Lw = sdrCeiling (the SDR white point in signal space)
+            const float Lw = sdrCeiling;
+            const float Lw2 = Lw * Lw;
+            long long compressedBlocks = 0;
+
+            #pragma omp parallel for schedule(dynamic, 16) reduction(+:compressedBlocks)
+            for (int by = 0; by < bh; ++by) {
+                for (int bx = 0; bx < bw; ++bx) {
+                    // Check highlight mask at block center (use top-left pixel of block)
+                    int ax = bx * 2;
+                    int ay = by * 2;
+                    float hlMask = highlightMask(ax, ay);
+                    if (hlMask <= 0.0f) continue;
+
+                    // Extract base luminance
+                    float L = std::exp(logBase(bx, by));
+
+                    // Reinhard extended shoulder compression
+                    float L_compressed = L * (1.0f + L / Lw2) / (1.0f + L / Lw);
+
+                    // Blend with mask and pull strength
+                    float pm = highlightPull * hlMask;
+                    float epm = 1.0f - (1.0f - pm) * (1.0f - pm);  // quadratic ease-in
+                    float L_final = L + (L_compressed - L) * epm;
+
+                    // Compute scale factor from base layer compression
+                    float scale = (L > 0.01f) ? L_final / L : 1.0f;
+                    if (scale < 0.01f) scale = 0.01f;
+                    if (scale > 1.0f) scale = 1.0f;
+
+                    // Apply same scale to all 4 pixels in the 2x2 block
+                    int px = static_cast<int>(params.leftMargin) + ax;
+                    int py = static_cast<int>(params.topMargin) + ay;
+                    for (int dy = 0; dy < 2; ++dy)
+                        for (int dx = 0; dx < 2; ++dx) {
+                            float black = params.blackAt(ax + dx, ay + dy);
+                            float signal = dst(px + dx, py + dy) - black;
+                            dst(px + dx, py + dy) = signal * scale + black;
+                        }
+                    ++compressedBlocks;
+                }
+            }
+
+            Log::debug("Bilateral highlight compression: ", compressedBlocks,
+                       " blocks compressed (spatialSigma=", spatialSigma,
+                       " rangeSigma=", rangeSigma, " radius=", bilateralR, ")");
         } else {
-            Log::debug("Highlights already below SDR white (sdrScale=",
-                       sdrScale, "), skipping pull");
+            Log::debug("Highlights already below SDR white (sdrCeiling=",
+                       sdrCeiling, "), skipping bilateral compression");
         }
     }
 
