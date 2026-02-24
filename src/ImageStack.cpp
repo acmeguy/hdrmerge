@@ -2061,15 +2061,29 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         }
     }
 
-    // Scale to params.max and recover the black levels
+    // Scale to params.max and recover the black levels.
+    // Clamp highlights per 2x2 Bayer block to preserve CFA channel ratios;
+    // independent per-pixel clamping destroys color balance in saturated
+    // regions (all channels → same clampMax → magenta after WB).
     float mult = (params.max - params.maxBlack) / normVal;
     float clampMax = static_cast<float>(params.max - params.maxBlack);
     #pragma omp parallel for
-    for (size_t y = 0; y < params.rawHeight; ++y) {
-        for (size_t x = 0; x < params.rawWidth; ++x) {
-            float v = dst(x, y) * mult;
-            if (v > clampMax) v = clampMax;
-            dst(x, y) = v + params.blackAt(x - params.leftMargin, y - params.topMargin);
+    for (size_t y = 0; y < params.rawHeight; y += 2) {
+        for (size_t x = 0; x < params.rawWidth; x += 2) {
+            float sigs[2][2] = {};
+            float maxSig = 0.0f;
+            for (int dy = 0; dy < 2 && y + dy < params.rawHeight; ++dy)
+                for (int dx = 0; dx < 2 && x + dx < params.rawWidth; ++dx) {
+                    float v = dst(x + dx, y + dy) * mult;
+                    sigs[dy][dx] = v;
+                    if (v > maxSig) maxSig = v;
+                }
+            float blockScale = (maxSig > clampMax) ? clampMax / maxSig : 1.0f;
+            for (int dy = 0; dy < 2 && y + dy < params.rawHeight; ++dy)
+                for (int dx = 0; dx < 2 && x + dx < params.rawWidth; ++dx)
+                    dst(x + dx, y + dy) = sigs[dy][dx] * blockScale
+                        + params.blackAt(x + dx - params.leftMargin,
+                                         y + dy - params.topMargin);
         }
     }
 
