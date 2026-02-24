@@ -39,6 +39,7 @@ struct ComposeResult {
     double baselineExposureEV;  // EV shift for correct default rendering
     int numImages;              // number of merged exposures (for BaselineNoise)
     double noiseProfile[8] = {};  // 2 doubles per channel (S, O): variance = S*signal + O
+    double ghostScore = 0.0;       // 0 = clean, higher = more ghost fringing
 };
 
 class ImageStack {
@@ -61,7 +62,9 @@ public:
                            DeghostMode deghostMode = DeghostMode::Robust,
                            int deghostIterations = 1,
                            double clipPercentile = 99.9,
-                           bool subPixelAlign = false) const;
+                           bool subPixelAlign = false,
+                           float highlightPull = 0.0f,
+                           float highlightRolloff = 0.9f) const;
 
     size_t size() const { return images.size(); }
 

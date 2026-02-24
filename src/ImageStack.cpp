@@ -1378,7 +1378,7 @@ static inline double interpolateCFA(const Image & img, int x, int y,
 }
 
 
-ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, DeghostMode deghostMode, int deghostIterations, double clipPercentile, bool subPixelAlign) const {
+ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, DeghostMode deghostMode, int deghostIterations, double clipPercentile, bool subPixelAlign, float highlightPull, float highlightRolloff) const {
     int imageMax = images.size() - 1;
     BoxBlur map(fattenMask(mask, featherRadius));
     measureTime("Blur", [&] () {
@@ -1635,6 +1635,204 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         }
     }
 
+    // === Highlight detection pass ===
+    // Build a feathered, graduated mask identifying near-saturated regions.
+    // Uses the middle exposure for detection (longest is too saturated to
+    // discriminate). Threshold is found automatically via Otsu's method on
+    // the brightness histogram, or overridden by user's --highlight-rolloff.
+    // The mask is graduated: brighter pixels get higher mask values, so the
+    // pull effect is proportional to how blown each pixel is.
+    Array2D<float> highlightMask;
+    double hlThreshold = 0.9;  // effective Otsu threshold (set by detection pass)
+    const bool doHighlightPull = highlightPull > 0.0f;
+    if (doHighlightPull) {
+        Log::debug("Highlight pull enabled: pull=", highlightPull,
+                   " rolloff=", highlightRolloff);
+
+        const int hlDetectIdx = numImages / 2;
+        Log::debug("Highlight detection frame: image[", hlDetectIdx, "]");
+
+        // Phase 1: Compute per-pixel brightness ratios and build histogram
+        // for Otsu threshold finding
+        Array2D<float> brightnessMap(width, height);
+        const int histBins = 256;
+        std::vector<long long> histogram(histBins, 0);
+        long long brightCount = 0;
+
+        #pragma omp parallel
+        {
+            std::vector<long long> localHist(histBins, 0);
+            long long localBright = 0;
+            #pragma omp for nowait
+            for (size_t y = 0; y < height; ++y) {
+                for (size_t x = 0; x < width; ++x) {
+                    if (!images[hlDetectIdx].contains(x, y)) {
+                        brightnessMap(x, y) = 0.0f;
+                        continue;
+                    }
+                    int ch = params.FC(x, y);
+                    double raw = static_cast<double>(images[hlDetectIdx](x, y));
+                    float b = static_cast<float>(raw / satThreshPerCh[ch]);
+                    if (b > 1.0f) b = 1.0f;
+                    brightnessMap(x, y) = b;
+                    if (b > 0.5f) {
+                        int bin = static_cast<int>(b * (histBins - 1));
+                        if (bin >= histBins) bin = histBins - 1;
+                        localHist[bin]++;
+                        localBright++;
+                    }
+                }
+            }
+            #pragma omp critical
+            {
+                for (int i = 0; i < histBins; i++)
+                    histogram[i] += localHist[i];
+                brightCount += localBright;
+            }
+        }
+
+        if (brightCount < 100) {
+            Log::debug("Too few bright pixels (", brightCount, "), disabling highlight pull");
+        } else {
+            // Phase 2: Otsu's method on bright pixels (>0.5) to find
+            // the natural break between "bright interior" and "blown highlights"
+            int otsuStart = histBins / 2;
+            double otsuThreshold = highlightRolloff;
+
+            double totalSum = 0.0, totalN = 0.0;
+            for (int i = otsuStart; i < histBins; i++) {
+                totalSum += (double)i * histogram[i];
+                totalN += histogram[i];
+            }
+
+            if (totalN > 0) {
+                double bestVariance = 0.0;
+                int bestBin = otsuStart;
+                double sumB = 0.0, nB = 0.0;
+                for (int i = otsuStart; i < histBins - 1; i++) {
+                    nB += histogram[i];
+                    if (nB == 0) continue;
+                    double nF = totalN - nB;
+                    if (nF == 0) break;
+                    sumB += (double)i * histogram[i];
+                    double meanB = sumB / nB;
+                    double meanF = (totalSum - sumB) / nF;
+                    double variance = nB * nF * (meanB - meanF) * (meanB - meanF);
+                    if (variance > bestVariance) {
+                        bestVariance = variance;
+                        bestBin = i;
+                    }
+                }
+                double otsuVal = static_cast<double>(bestBin) / (histBins - 1);
+                otsuVal = std::max(0.7, std::min(0.98, otsuVal));
+                Log::debug("Otsu threshold: ", otsuVal, " (bin ", bestBin, "/", histBins, ")");
+
+                // Use the lower of Otsu and user-specified rolloff
+                otsuThreshold = std::min(otsuVal, static_cast<double>(highlightRolloff));
+            }
+            hlThreshold = otsuThreshold;
+            Log::debug("Effective highlight threshold: ", otsuThreshold);
+
+            // Phase 3: Build graduated core mask at 2x2 Bayer block resolution.
+            // Using the MAX brightness in each 2x2 block ensures all CFA channels
+            // at the same spatial location get identical mask values, preventing
+            // color shifts from differential per-channel compression.
+            double invRange = 1.0 / std::max(0.01, 1.0 - otsuThreshold);
+            long long coreCount = 0;
+            highlightMask = Array2D<float>(width, height);
+
+            #pragma omp parallel for reduction(+:coreCount)
+            for (size_t y = 0; y < height; y += 2) {
+                for (size_t x = 0; x < width; x += 2) {
+                    // Find max brightness across the 2x2 Bayer block
+                    float maxB = brightnessMap(x, y);
+                    if (x + 1 < width) maxB = std::max(maxB, brightnessMap(x + 1, y));
+                    if (y + 1 < height) maxB = std::max(maxB, brightnessMap(x, y + 1));
+                    if (x + 1 < width && y + 1 < height)
+                        maxB = std::max(maxB, brightnessMap(x + 1, y + 1));
+
+                    float m = 0.0f;
+                    if (maxB > otsuThreshold) {
+                        m = static_cast<float>((maxB - otsuThreshold) * invRange);
+                        if (m > 1.0f) m = 1.0f;
+                        coreCount += 4;
+                    }
+
+                    // Apply uniform mask to all pixels in this block
+                    highlightMask(x, y) = m;
+                    if (x + 1 < width) highlightMask(x + 1, y) = m;
+                    if (y + 1 < height) highlightMask(x, y + 1) = m;
+                    if (x + 1 < width && y + 1 < height)
+                        highlightMask(x + 1, y + 1) = m;
+                }
+            }
+
+            double corePct = 100.0 * coreCount / (width * height);
+            Log::debug("Highlight core: ", corePct, "% of pixels (graduated)");
+
+            if (coreCount == 0) {
+                Log::debug("No highlight pixels above threshold, disabling");
+                highlightMask = Array2D<float>();
+            } else {
+                // Phase 4: Feather using iterative box blur (3 passes ~ Gaussian)
+                int hlFeatherRadius = featherRadius * 2;
+
+                for (int pass = 0; pass < 3; ++pass) {
+                    Array2D<float> tmp(width, height);
+                    #pragma omp parallel for
+                    for (size_t y = 0; y < height; ++y) {
+                        for (size_t x = 0; x < width; ++x) {
+                            float sum = 0.0f;
+                            int count = 0;
+                            int x0 = std::max(0, (int)x - hlFeatherRadius);
+                            int x1 = std::min((int)width - 1, (int)x + hlFeatherRadius);
+                            for (int nx = x0; nx <= x1; ++nx) {
+                                sum += highlightMask(nx, y);
+                                count++;
+                            }
+                            tmp(x, y) = sum / count;
+                        }
+                    }
+                    #pragma omp parallel for
+                    for (size_t y = 0; y < height; ++y) {
+                        for (size_t x = 0; x < width; ++x) {
+                            float sum = 0.0f;
+                            int count = 0;
+                            int y0 = std::max(0, (int)y - hlFeatherRadius);
+                            int y1 = std::min((int)height - 1, (int)y + hlFeatherRadius);
+                            for (int ny = y0; ny <= y1; ++ny) {
+                                sum += tmp(x, ny);
+                                count++;
+                            }
+                            highlightMask(x, y) = sum / count;
+                        }
+                    }
+                }
+
+                // Clamp to [0, 1]
+                #pragma omp parallel for
+                for (size_t y = 0; y < height; ++y)
+                    for (size_t x = 0; x < width; ++x)
+                        if (highlightMask(x, y) > 1.0f) highlightMask(x, y) = 1.0f;
+
+                // Log stats
+                long long featheredCount = 0;
+                float maskMean = 0.0f;
+                #pragma omp parallel for reduction(+:featheredCount) reduction(+:maskMean)
+                for (size_t y = 0; y < height; ++y)
+                    for (size_t x = 0; x < width; ++x) {
+                        if (highlightMask(x, y) > 0.01f) featheredCount++;
+                        maskMean += highlightMask(x, y);
+                    }
+                double featheredPct = 100.0 * featheredCount / (width * height);
+                maskMean /= (width * height);
+                Log::debug("Highlight feathered region: ", featheredPct,
+                           "% of pixels, mean mask=", maskMean,
+                           " (feather radius=", hlFeatherRadius, ")");
+            }
+        }
+    }
+
     float maxVal = 0.0;
     #pragma omp parallel for schedule(dynamic,16) reduction(max:maxVal)
     for (size_t y = 0; y < height; ++y) {
@@ -1647,6 +1845,10 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         for (size_t x = 0; x < width; ++x) {
             int numValid = 0;
             int ch = params.FC(x, y);
+
+            // Highlight mask value for this pixel (0 = normal, >0 = highlight region)
+            float hlMask = (doHighlightPull && highlightMask.size() > 0)
+                ? highlightMask(x, y) : 0.0f;
 
             // Collect valid exposures with their radiances and weights
             for (int k = 0; k <= imageMax; k++) {
@@ -1679,15 +1881,29 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                 if (pixelVar < 1.0) pixelVar = 1.0;
                 double w = 1.0 / (relExp[k] * relExp[k] * pixelVar);
                 if (useBlockRolloff) {
+                    double effectiveBlockRolloff = blockRolloff;
+                    double effectiveBlockRange = blockRange;
+                    if (hlMask > 0.0f) {
+                        double effectiveFrac = 0.9 - hlMask * (0.9 - highlightRolloff);
+                        effectiveBlockRolloff = effectiveFrac * blockThresh;
+                        effectiveBlockRange = blockThresh - effectiveBlockRolloff;
+                    }
                     if (raw >= blockThresh) {
                         w = 0.0;
-                    } else if (raw > blockRolloff) {
-                        double t = (blockThresh - raw) / blockRange;
+                    } else if (raw > effectiveBlockRolloff) {
+                        double t = (blockThresh - raw) / effectiveBlockRange;
                         w *= t * t;
                     }
                 } else {
-                    if (raw > satRolloffPerCh[ch]) {
-                        double t = (satThreshPerCh[ch] - raw) / satRolloffRangePerCh[ch];
+                    double effectiveRolloff = satRolloffPerCh[ch];
+                    double effectiveRange = satRolloffRangePerCh[ch];
+                    if (hlMask > 0.0f) {
+                        double effectiveFrac = 0.9 - hlMask * (0.9 - highlightRolloff);
+                        effectiveRolloff = effectiveFrac * satThreshPerCh[ch];
+                        effectiveRange = satThreshPerCh[ch] - effectiveRolloff;
+                    }
+                    if (raw > effectiveRolloff) {
+                        double t = (satThreshPerCh[ch] - raw) / effectiveRange;
                         w *= t * t;
                     }
                 }
@@ -1800,11 +2016,6 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                 v = weightedSum / totalWeight;
             } else {
                 // All exposures saturated or unavailable — use darkest image.
-                // Using the darkest image (imageMax) ensures the response function
-                // slope is consistent with the merge path, and the radiance for
-                // near-clipped pixels is as high as possible. For truly clipped
-                // pixels, the high radiance normalizes to near-white, allowing
-                // the DNG processor's highlight recovery to handle it correctly.
                 if (images[imageMax].contains(x, y)) {
                     v = images[imageMax].exposureAt(x, y);
                 } else {
@@ -1861,7 +2072,8 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         }
     }
 
-    // Compute BaselineExposure from median of log-luminance (robust to HDR skew)
+    // Compute BaselineExposure BEFORE highlight pull so we can use it
+    // to determine the SDR-aware scale factor.
     double baselineExposureEV = 0.0;
     {
         // Pass 1: find log-luminance range and pixel count
@@ -1940,10 +2152,169 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                " normVal=", normVal, " maxVal=", maxVal,
                " BaselineExposure=", baselineExposureEV, " EV");
 
+    // SDR-aware post-normalization highlight pull.
+    // In Lightroom SDR mode, a DNG signal `s` renders as:
+    //   sdrRendered = (s / whiteLevel) * 2^BaselineExposure
+    // For SDR visibility we need sdrRendered < 1.0, i.e. s < whiteLevel * 2^(-BE).
+    // We target 100% of this ceiling — highlights land right at SDR white.
+    // The default profile's Highlights2012="-95" then brings them into visible
+    // range. This keeps HDR rendering less dark than a lower target would.
+    // Power interpolation (scale = sdrScale^epm) operates in log-space so that
+    // pull=0.8 with quadratic ease-in compresses ~96% of the way to the target.
+    // Channel-neutral: 2x2 block mask ensures same scale for all CFA channels.
+    if (doHighlightPull && highlightMask.size() > 0) {
+        float sdrCeiling = clampMax * std::pow(2.0f, -static_cast<float>(baselineExposureEV));
+        float sdrTarget = sdrCeiling;
+        float sdrScale = (clampMax > 0.0f) ? sdrTarget / clampMax : 1.0f;
+
+        if (sdrScale < 1.0f && sdrScale > 0.0f) {
+            Log::debug("SDR-aware pull: sdrCeiling=", sdrCeiling,
+                       " sdrTarget=", sdrTarget,
+                       " sdrScale=", sdrScale);
+
+            #pragma omp parallel for schedule(dynamic, 16)
+            for (size_t y = params.topMargin; y < params.topMargin + params.height; ++y) {
+                for (size_t x = params.leftMargin; x < params.leftMargin + params.width; ++x) {
+                    float hlMask = highlightMask(x - params.leftMargin, y - params.topMargin);
+                    if (hlMask > 0.0f) {
+                        float black = params.blackAt(x - params.leftMargin, y - params.topMargin);
+                        float signal = dst(x, y) - black;
+                        if (signal > 0.0f) {
+                            float pm = highlightPull * hlMask;
+                            float epm = 1.0f - (1.0f - pm) * (1.0f - pm);
+                            float scale = std::pow(sdrScale, epm);
+                            dst(x, y) = signal * scale + black;
+                        }
+                    }
+                }
+            }
+            Log::debug("Post-normalization SDR-aware highlight pull applied");
+        } else {
+            Log::debug("Highlights already below SDR white (sdrScale=",
+                       sdrScale, "), skipping pull");
+        }
+    }
+
+    // Ghost artifact scoring: detect color fringe via log-ratio gradients on 2x2 Bayer blocks
+    double ghostScore = 0.0;
+    if (params.FC.getFilters() != 9) { // Bayer only
+        const int bw = static_cast<int>(params.width) / 2;
+        const int bh = static_cast<int>(params.height) / 2;
+        if (bw > 4 && bh > 4) {
+            // Extract per-block log color ratios
+            std::vector<float> logRG(bw * bh, 0.0f);
+            std::vector<float> logBG(bw * bh, 0.0f);
+
+            #pragma omp parallel for
+            for (int by = 0; by < bh; ++by) {
+                for (int bx = 0; bx < bw; ++bx) {
+                    // Map block to active-area pixel coordinates
+                    int px = static_cast<int>(params.leftMargin) + bx * 2;
+                    int py = static_cast<int>(params.topMargin) + by * 2;
+                    float channels[4] = {};  // indexed by CFA color
+                    int counts[4] = {};
+                    for (int dy = 0; dy < 2; ++dy) {
+                        for (int dx = 0; dx < 2; ++dx) {
+                            int ax = bx * 2 + dx;
+                            int ay = by * 2 + dy;
+                            uint8_t c = params.FC(ax, ay);
+                            float v = dst(px + dx, py + dy)
+                                      - params.blackAt(ax, ay);
+                            if (v < 1.0f) v = 1.0f;
+                            channels[c] += v;
+                            counts[c]++;
+                        }
+                    }
+                    // Average each channel
+                    for (int c = 0; c < 4; ++c)
+                        if (counts[c] > 0) channels[c] /= counts[c];
+
+                    // RGGB: 0=R, 1=G, 2=B, 3=G2 — average the two greens
+                    float G = (counts[1] > 0 ? channels[1] : 0.0f);
+                    if (counts[3] > 0) G = (G + channels[3]) * 0.5f;
+                    float R = channels[0];
+                    float B = channels[2];
+
+                    int idx = by * bw + bx;
+                    if (G > 1.0f && R > 1.0f)
+                        logRG[idx] = std::log2(R / G);
+                    if (G > 1.0f && B > 1.0f)
+                        logBG[idx] = std::log2(B / G);
+                }
+            }
+
+            // Sobel gradient magnitude + local deviation from 5x5 mean
+            long fringeCount = 0;
+            long totalBlocks = 0;
+            const float gradThresh = 0.4f;
+            const float devThresh = 0.3f;
+
+            #pragma omp parallel for reduction(+:fringeCount, totalBlocks)
+            for (int by = 3; by < bh - 3; ++by) {
+                for (int bx = 3; bx < bw - 3; ++bx) {
+                    totalBlocks++;
+                    // Sobel on logRG
+                    float gxRG = -logRG[(by-1)*bw + bx-1] + logRG[(by-1)*bw + bx+1]
+                                 -2*logRG[by*bw + bx-1]   + 2*logRG[by*bw + bx+1]
+                                 -logRG[(by+1)*bw + bx-1]  + logRG[(by+1)*bw + bx+1];
+                    float gyRG = -logRG[(by-1)*bw + bx-1] - 2*logRG[(by-1)*bw + bx]
+                                 -logRG[(by-1)*bw + bx+1]
+                                 +logRG[(by+1)*bw + bx-1] + 2*logRG[(by+1)*bw + bx]
+                                 +logRG[(by+1)*bw + bx+1];
+                    float gradRG = std::sqrt(gxRG*gxRG + gyRG*gyRG) * 0.125f;
+
+                    // Sobel on logBG
+                    float gxBG = -logBG[(by-1)*bw + bx-1] + logBG[(by-1)*bw + bx+1]
+                                 -2*logBG[by*bw + bx-1]   + 2*logBG[by*bw + bx+1]
+                                 -logBG[(by+1)*bw + bx-1]  + logBG[(by+1)*bw + bx+1];
+                    float gyBG = -logBG[(by-1)*bw + bx-1] - 2*logBG[(by-1)*bw + bx]
+                                 -logBG[(by-1)*bw + bx+1]
+                                 +logBG[(by+1)*bw + bx-1] + 2*logBG[(by+1)*bw + bx]
+                                 +logBG[(by+1)*bw + bx+1];
+                    float gradBG = std::sqrt(gxBG*gxBG + gyBG*gyBG) * 0.125f;
+
+                    float grad = std::max(gradRG, gradBG);
+                    if (grad < gradThresh) continue;
+
+                    // 5x5 local mean deviation
+                    float sumRG = 0, sumBG = 0;
+                    for (int dy = -2; dy <= 2; ++dy)
+                        for (int dx = -2; dx <= 2; ++dx) {
+                            int idx = (by + dy) * bw + (bx + dx);
+                            sumRG += logRG[idx];
+                            sumBG += logBG[idx];
+                        }
+                    float meanRG = sumRG / 25.0f;
+                    float meanBG = sumBG / 25.0f;
+                    int cidx = by * bw + bx;
+                    float devRG = std::abs(logRG[cidx] - meanRG);
+                    float devBG = std::abs(logBG[cidx] - meanBG);
+                    float dev = std::max(devRG, devBG);
+
+                    if (dev < devThresh) continue;
+
+                    // Classify fringe hue
+                    float rg = logRG[cidx], bg = logBG[cidx];
+                    bool isFringe = (rg > 0.5f && bg < 0.3f)    // pink/magenta
+                                 || (rg < -0.3f && bg < 0.3f)   // green
+                                 || (rg > 0.3f && bg > 0.3f)    // purple
+                                 || (rg > 0.3f && bg < -0.5f);  // yellow
+                    if (isFringe)
+                        fringeCount++;
+                }
+            }
+
+            if (totalBlocks > 0)
+                ghostScore = (static_cast<double>(fringeCount) / totalBlocks) * 1000.0;
+        }
+    }
+    Log::debug("Ghost artifact score: ", ghostScore);
+
     ComposeResult result;
     result.image = std::move(dst);
     result.baselineExposureEV = baselineExposureEV;
     result.numImages = numImages;
+    result.ghostScore = ghostScore;
 
     // Copy noise profile (already estimated before compose loop)
     std::copy(noiseProfile, noiseProfile + 8, result.noiseProfile);

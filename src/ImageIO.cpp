@@ -189,7 +189,7 @@ int ImageIO::load(const LoadOptions & options, ProgressIndicator & progress) {
 }
 
 
-void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
+double ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
     string cropped = stack.isCropped() ? " cropped" : "";
     Log::debug(options.fileName);
     Log::debug("  ", options.bps, "-bit, ", stack.getWidth(), 'x', stack.getHeight(), cropped);
@@ -205,7 +205,9 @@ void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
                                              options.deghostMode,
                                              options.deghostIterations,
                                              options.clipPercentile,
-                                             options.subPixelAlign);
+                                             options.subPixelAlign,
+                                             options.highlightPull,
+                                             options.highlightRolloff);
 
     if (options.resizeLong > 0) {
         progress.advance(20, "Resizing image");
@@ -248,6 +250,7 @@ void ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) {
         QString name = replaceArguments(options.maskFileName, options.fileName);
         writeMaskImage(name);
     }
+    return composed.ghostScore;
 }
 
 

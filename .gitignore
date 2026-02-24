@@ -15,3 +15,5 @@ hdrmerge.kde*
 moc_*
 samples/
 third_party/xmp_sdk
+.worktrees/
+.cache*/
