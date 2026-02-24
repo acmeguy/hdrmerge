@@ -2060,30 +2060,8 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
         }
     }
 
-    // Post-normalization highlight pull: scale down DNG values in highlight
-    // regions.  This happens AFTER normalization so the scaling is final —
-    // it can't be undone.  Highlights at the white level get pulled down to
-    // (1 - pull * mask) * whiteLevel, making them visible in SDR.
-    // Channel-neutral: same scale factor for all CFA channels at a given
-    // pixel, so no color shift.
-    if (doHighlightPull && highlightMask.size() > 0) {
-        #pragma omp parallel for schedule(dynamic, 16)
-        for (size_t y = params.topMargin; y < params.topMargin + params.height; ++y) {
-            for (size_t x = params.leftMargin; x < params.leftMargin + params.width; ++x) {
-                float hlMask = highlightMask(x - params.leftMargin, y - params.topMargin);
-                if (hlMask > 0.0f) {
-                    float black = params.blackAt(x - params.leftMargin, y - params.topMargin);
-                    float signal = dst(x, y) - black;
-                    float scale = 1.0f - highlightPull * hlMask;
-                    dst(x, y) = signal * scale + black;
-                }
-            }
-        }
-        Log::debug("Post-normalization highlight pull applied (pull=",
-                   highlightPull, ")");
-    }
-
-    // Compute BaselineExposure from median of log-luminance (robust to HDR skew)
+    // Compute BaselineExposure BEFORE highlight pull so we can use it
+    // to determine the SDR-aware scale factor.
     double baselineExposureEV = 0.0;
     {
         // Pass 1: find log-luminance range and pixel count
@@ -2161,6 +2139,48 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
     Log::debug("Normalization: clipPercentile=", clipPercentile,
                " normVal=", normVal, " maxVal=", maxVal,
                " BaselineExposure=", baselineExposureEV, " EV");
+
+    // SDR-aware post-normalization highlight pull.
+    // In Lightroom SDR mode, a DNG signal `s` renders as:
+    //   sdrRendered = (s / whiteLevel) * 2^BaselineExposure
+    // For SDR visibility we need sdrRendered < 1.0, i.e. s < whiteLevel * 2^(-BE).
+    // We call that threshold the "SDR ceiling" and target 70% of it so that
+    // highlights land comfortably below SDR white.
+    // Power interpolation (scale = sdrScale^epm) operates in log-space so that
+    // pull=0.8 with quadratic ease-in compresses ~96% of the way to the target.
+    // Channel-neutral: same scale for all CFA channels → no color shift.
+    if (doHighlightPull && highlightMask.size() > 0) {
+        float sdrCeiling = clampMax * std::pow(2.0f, -static_cast<float>(baselineExposureEV));
+        float sdrTarget = sdrCeiling * 0.7f;
+        float sdrScale = (clampMax > 0.0f) ? sdrTarget / clampMax : 1.0f;
+
+        if (sdrScale < 1.0f && sdrScale > 0.0f) {
+            Log::debug("SDR-aware pull: sdrCeiling=", sdrCeiling,
+                       " sdrTarget=", sdrTarget,
+                       " sdrScale=", sdrScale);
+
+            #pragma omp parallel for schedule(dynamic, 16)
+            for (size_t y = params.topMargin; y < params.topMargin + params.height; ++y) {
+                for (size_t x = params.leftMargin; x < params.leftMargin + params.width; ++x) {
+                    float hlMask = highlightMask(x - params.leftMargin, y - params.topMargin);
+                    if (hlMask > 0.0f) {
+                        float black = params.blackAt(x - params.leftMargin, y - params.topMargin);
+                        float signal = dst(x, y) - black;
+                        if (signal > 0.0f) {
+                            float pm = highlightPull * hlMask;
+                            float epm = 1.0f - (1.0f - pm) * (1.0f - pm);
+                            float scale = std::pow(sdrScale, epm);
+                            dst(x, y) = signal * scale + black;
+                        }
+                    }
+                }
+            }
+            Log::debug("Post-normalization SDR-aware highlight pull applied");
+        } else {
+            Log::debug("Highlights already below SDR white (sdrScale=",
+                       sdrScale, "), skipping pull");
+        }
+    }
 
     // Ghost artifact scoring: detect color fringe via log-ratio gradients on 2x2 Bayer blocks
     double ghostScore = 0.0;
