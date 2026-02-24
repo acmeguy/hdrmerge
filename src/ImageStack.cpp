@@ -1636,124 +1636,186 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
     }
 
     // === Highlight detection pass ===
-    // Build a feathered mask identifying near-saturated regions in the reference
-    // frame (image 0, longest exposure). Used for earlier rolloff and radiance
-    // compression when highlightPull > 0.
+    // Build a feathered, graduated mask identifying near-saturated regions.
+    // Uses the middle exposure for detection (longest is too saturated to
+    // discriminate). Threshold is found automatically via Otsu's method on
+    // the brightness histogram, or overridden by user's --highlight-rolloff.
+    // The mask is graduated: brighter pixels get higher mask values, so the
+    // pull effect is proportional to how blown each pixel is.
     Array2D<float> highlightMask;
     const bool doHighlightPull = highlightPull > 0.0f;
     if (doHighlightPull) {
         Log::debug("Highlight pull enabled: pull=", highlightPull,
                    " rolloff=", highlightRolloff);
 
-        // Phase 1: Identify core highlight pixels
-        // Use the middle exposure for detection — the longest exposure has most
-        // of the scene near saturation, making it a poor discriminator. The middle
-        // exposure better separates "normal bright interior" from "blown highlights".
-        // A pixel is "highlight core" if its raw value exceeds highlightRolloff
-        // fraction of its channel's saturation threshold in the detection frame.
         const int hlDetectIdx = numImages / 2;
         Log::debug("Highlight detection frame: image[", hlDetectIdx, "]");
-        Array2D<uint8_t> highlightCore(width, height);
-        #pragma omp parallel for
-        for (size_t y = 0; y < height; ++y) {
-            for (size_t x = 0; x < width; ++x) {
-                if (!images[hlDetectIdx].contains(x, y)) {
-                    highlightCore(x, y) = 0;
-                    continue;
+
+        // Phase 1: Compute per-pixel brightness ratios and build histogram
+        // for Otsu threshold finding
+        Array2D<float> brightnessMap(width, height);
+        const int histBins = 256;
+        std::vector<long long> histogram(histBins, 0);
+        long long brightCount = 0;
+
+        #pragma omp parallel
+        {
+            std::vector<long long> localHist(histBins, 0);
+            long long localBright = 0;
+            #pragma omp for nowait
+            for (size_t y = 0; y < height; ++y) {
+                for (size_t x = 0; x < width; ++x) {
+                    if (!images[hlDetectIdx].contains(x, y)) {
+                        brightnessMap(x, y) = 0.0f;
+                        continue;
+                    }
+                    int ch = params.FC(x, y);
+                    double raw = static_cast<double>(images[hlDetectIdx](x, y));
+                    float b = static_cast<float>(raw / satThreshPerCh[ch]);
+                    if (b > 1.0f) b = 1.0f;
+                    brightnessMap(x, y) = b;
+                    if (b > 0.5f) {
+                        int bin = static_cast<int>(b * (histBins - 1));
+                        if (bin >= histBins) bin = histBins - 1;
+                        localHist[bin]++;
+                        localBright++;
+                    }
                 }
-                int ch = params.FC(x, y);
-                double raw = static_cast<double>(images[hlDetectIdx](x, y));
-                double brightness = raw / satThreshPerCh[ch];
-                highlightCore(x, y) = (brightness > highlightRolloff) ? 1 : 0;
+            }
+            #pragma omp critical
+            {
+                for (int i = 0; i < histBins; i++)
+                    histogram[i] += localHist[i];
+                brightCount += localBright;
             }
         }
 
-        // Count core pixels for logging
-        long long coreCount = 0;
-        #pragma omp parallel for reduction(+:coreCount)
-        for (size_t y = 0; y < height; ++y)
-            for (size_t x = 0; x < width; ++x)
-                if (highlightCore(x, y)) coreCount++;
-        double corePct = 100.0 * coreCount / (width * height);
-        Log::debug("Highlight core: ", corePct, "% of pixels");
-
-        if (coreCount == 0) {
-            Log::debug("No highlight pixels detected, disabling highlight pull");
+        if (brightCount < 100) {
+            Log::debug("Too few bright pixels (", brightCount, "), disabling highlight pull");
         } else {
-            // Phase 2: Dilate + feather using iterative box blur
-            // The blur radius is featherRadius * 2 (wider than exposure mask blur).
-            // 3 passes of box blur approximate a Gaussian falloff.
-            highlightMask = Array2D<float>(width, height);
-            int hlFeatherRadius = featherRadius * 2;
+            // Phase 2: Otsu's method on bright pixels (>0.5) to find
+            // the natural break between "bright interior" and "blown highlights"
+            int otsuStart = histBins / 2;
+            double otsuThreshold = highlightRolloff;
 
-            // Seed mask: 1.0 at core pixels, 0.0 elsewhere
-            #pragma omp parallel for
-            for (size_t y = 0; y < height; ++y)
-                for (size_t x = 0; x < width; ++x)
-                    highlightMask(x, y) = highlightCore(x, y) ? 1.0f : 0.0f;
+            double totalSum = 0.0, totalN = 0.0;
+            for (int i = otsuStart; i < histBins; i++) {
+                totalSum += (double)i * histogram[i];
+                totalN += histogram[i];
+            }
 
-            // Iterative separable box blur for smooth feathering
-            for (int pass = 0; pass < 3; ++pass) {
-                // Horizontal pass
-                Array2D<float> tmp(width, height);
-                #pragma omp parallel for
-                for (size_t y = 0; y < height; ++y) {
-                    for (size_t x = 0; x < width; ++x) {
-                        float sum = 0.0f;
-                        int count = 0;
-                        int x0 = std::max(0, (int)x - hlFeatherRadius);
-                        int x1 = std::min((int)width - 1, (int)x + hlFeatherRadius);
-                        for (int nx = x0; nx <= x1; ++nx) {
-                            sum += highlightMask(nx, y);
-                            count++;
-                        }
-                        tmp(x, y) = sum / count;
+            if (totalN > 0) {
+                double bestVariance = 0.0;
+                int bestBin = otsuStart;
+                double sumB = 0.0, nB = 0.0;
+                for (int i = otsuStart; i < histBins - 1; i++) {
+                    nB += histogram[i];
+                    if (nB == 0) continue;
+                    double nF = totalN - nB;
+                    if (nF == 0) break;
+                    sumB += (double)i * histogram[i];
+                    double meanB = sumB / nB;
+                    double meanF = (totalSum - sumB) / nF;
+                    double variance = nB * nF * (meanB - meanF) * (meanB - meanF);
+                    if (variance > bestVariance) {
+                        bestVariance = variance;
+                        bestBin = i;
                     }
                 }
-                // Vertical pass
-                #pragma omp parallel for
-                for (size_t y = 0; y < height; ++y) {
-                    for (size_t x = 0; x < width; ++x) {
-                        float sum = 0.0f;
-                        int count = 0;
-                        int y0 = std::max(0, (int)y - hlFeatherRadius);
-                        int y1 = std::min((int)height - 1, (int)y + hlFeatherRadius);
-                        for (int ny = y0; ny <= y1; ++ny) {
-                            sum += tmp(x, ny);
-                            count++;
-                        }
-                        highlightMask(x, y) = sum / count;
+                double otsuVal = static_cast<double>(bestBin) / (histBins - 1);
+                otsuVal = std::max(0.7, std::min(0.98, otsuVal));
+                Log::debug("Otsu threshold: ", otsuVal, " (bin ", bestBin, "/", histBins, ")");
+
+                // Use the lower of Otsu and user-specified rolloff
+                otsuThreshold = std::min(otsuVal, static_cast<double>(highlightRolloff));
+            }
+            Log::debug("Effective highlight threshold: ", otsuThreshold);
+
+            // Phase 3: Build graduated core mask
+            // Mask is proportional to how far above threshold each pixel is.
+            // Fully saturated = 1.0, just above threshold = near-zero.
+            double invRange = 1.0 / std::max(0.01, 1.0 - otsuThreshold);
+            long long coreCount = 0;
+            highlightMask = Array2D<float>(width, height);
+
+            #pragma omp parallel for reduction(+:coreCount)
+            for (size_t y = 0; y < height; ++y) {
+                for (size_t x = 0; x < width; ++x) {
+                    float b = brightnessMap(x, y);
+                    if (b > otsuThreshold) {
+                        float m = static_cast<float>((b - otsuThreshold) * invRange);
+                        if (m > 1.0f) m = 1.0f;
+                        highlightMask(x, y) = m;
+                        coreCount++;
+                    } else {
+                        highlightMask(x, y) = 0.0f;
                     }
                 }
             }
 
-            // Renormalize: ensure core pixels are 1.0, and clamp to [0, 1]
-            float maskMax = 0.0f;
-            #pragma omp parallel for reduction(max:maskMax)
-            for (size_t y = 0; y < height; ++y)
-                for (size_t x = 0; x < width; ++x)
-                    if (highlightMask(x, y) > maskMax) maskMax = highlightMask(x, y);
+            double corePct = 100.0 * coreCount / (width * height);
+            Log::debug("Highlight core: ", corePct, "% of pixels (graduated)");
 
-            if (maskMax > 0.0f) {
-                float invMax = 1.0f / maskMax;
+            if (coreCount == 0) {
+                Log::debug("No highlight pixels above threshold, disabling");
+                highlightMask = Array2D<float>();
+            } else {
+                // Phase 4: Feather using iterative box blur (3 passes ~ Gaussian)
+                int hlFeatherRadius = featherRadius * 2;
+
+                for (int pass = 0; pass < 3; ++pass) {
+                    Array2D<float> tmp(width, height);
+                    #pragma omp parallel for
+                    for (size_t y = 0; y < height; ++y) {
+                        for (size_t x = 0; x < width; ++x) {
+                            float sum = 0.0f;
+                            int count = 0;
+                            int x0 = std::max(0, (int)x - hlFeatherRadius);
+                            int x1 = std::min((int)width - 1, (int)x + hlFeatherRadius);
+                            for (int nx = x0; nx <= x1; ++nx) {
+                                sum += highlightMask(nx, y);
+                                count++;
+                            }
+                            tmp(x, y) = sum / count;
+                        }
+                    }
+                    #pragma omp parallel for
+                    for (size_t y = 0; y < height; ++y) {
+                        for (size_t x = 0; x < width; ++x) {
+                            float sum = 0.0f;
+                            int count = 0;
+                            int y0 = std::max(0, (int)y - hlFeatherRadius);
+                            int y1 = std::min((int)height - 1, (int)y + hlFeatherRadius);
+                            for (int ny = y0; ny <= y1; ++ny) {
+                                sum += tmp(x, ny);
+                                count++;
+                            }
+                            highlightMask(x, y) = sum / count;
+                        }
+                    }
+                }
+
+                // Clamp to [0, 1]
                 #pragma omp parallel for
                 for (size_t y = 0; y < height; ++y)
-                    for (size_t x = 0; x < width; ++x) {
-                        float v = highlightMask(x, y) * invMax;
-                        if (v > 1.0f) v = 1.0f;
-                        highlightMask(x, y) = v;
-                    }
-            }
+                    for (size_t x = 0; x < width; ++x)
+                        if (highlightMask(x, y) > 1.0f) highlightMask(x, y) = 1.0f;
 
-            // Log feathered mask stats
-            long long featheredCount = 0;
-            #pragma omp parallel for reduction(+:featheredCount)
-            for (size_t y = 0; y < height; ++y)
-                for (size_t x = 0; x < width; ++x)
-                    if (highlightMask(x, y) > 0.01f) featheredCount++;
-            double featheredPct = 100.0 * featheredCount / (width * height);
-            Log::debug("Highlight feathered region: ", featheredPct,
-                       "% of pixels (feather radius=", hlFeatherRadius, ")");
+                // Log stats
+                long long featheredCount = 0;
+                float maskMean = 0.0f;
+                #pragma omp parallel for reduction(+:featheredCount) reduction(+:maskMean)
+                for (size_t y = 0; y < height; ++y)
+                    for (size_t x = 0; x < width; ++x) {
+                        if (highlightMask(x, y) > 0.01f) featheredCount++;
+                        maskMean += highlightMask(x, y);
+                    }
+                double featheredPct = 100.0 * featheredCount / (width * height);
+                maskMean /= (width * height);
+                Log::debug("Highlight feathered region: ", featheredPct,
+                           "% of pixels, mean mask=", maskMean,
+                           " (feather radius=", hlFeatherRadius, ")");
+            }
         }
     }
 
