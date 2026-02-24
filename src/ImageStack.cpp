@@ -1643,6 +1643,7 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
     // The mask is graduated: brighter pixels get higher mask values, so the
     // pull effect is proportional to how blown each pixel is.
     Array2D<float> highlightMask;
+    double hlThreshold = 0.9;  // effective Otsu threshold (set by detection pass)
     const bool doHighlightPull = highlightPull > 0.0f;
     if (doHighlightPull) {
         Log::debug("Highlight pull enabled: pull=", highlightPull,
@@ -1729,6 +1730,7 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                 // Use the lower of Otsu and user-specified rolloff
                 otsuThreshold = std::min(otsuVal, static_cast<double>(highlightRolloff));
             }
+            hlThreshold = otsuThreshold;
             Log::debug("Effective highlight threshold: ", otsuThreshold);
 
             // Phase 3: Build graduated core mask
@@ -2000,10 +2002,18 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
             double v;
             if (totalWeight > 0.0) {
                 v = weightedSum / totalWeight;
-                // Highlight radiance compression: reduce brightness in highlight regions
+                // Highlight radiance compression: power-curve compression
+                // in highlight regions.  Values above refLevel are compressed
+                // via v = refLevel * (v/refLevel)^gamma, where gamma < 1.
+                // This squashes extreme highlights (10-20x) into a narrow
+                // band that Lightroom can recover, while barely touching
+                // moderate highlights.
                 if (hlMask > 0.0f) {
-                    double pullFactor = 1.0 - static_cast<double>(highlightPull) * hlMask;
-                    v *= pullFactor;
+                    double refLevel = hlThreshold * satThreshPerCh[ch];
+                    if (v > refLevel && refLevel > 0.0) {
+                        double gamma = 1.0 - static_cast<double>(highlightPull) * hlMask;
+                        v = refLevel * std::pow(v / refLevel, gamma);
+                    }
                 }
             } else {
                 // All exposures saturated or unavailable — use darkest image.
