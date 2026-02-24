@@ -2300,14 +2300,36 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                     if (scale < 0.01f) scale = 0.01f;
                     if (scale > 1.0f) scale = 1.0f;
 
-                    // Apply same scale to all 4 pixels in the 2x2 block
+                    // Apply scale + highlight desaturation to all 4 pixels.
+                    // The per-pixel merge can introduce subtle channel ratio
+                    // errors near saturation (different exposures weighted
+                    // differently per CFA channel).  Gently blend toward
+                    // neutral as a function of how close the original block
+                    // luminance was to clampMax.
                     int px = static_cast<int>(params.leftMargin) + ax;
                     int py = static_cast<int>(params.topMargin) + ay;
+                    float origLum = std::exp(logLum(bx, by));  // WB-corrected
+                    float wbClampMax = clampMax * avgWBMul;
+                    float satRatio = origLum / wbClampMax;
+                    if (satRatio > 1.0f) satRatio = 1.0f;
+                    // smoothstep: desat kicks in above 50% saturation
+                    float desatT = (satRatio < 0.5f) ? 0.0f
+                        : (satRatio - 0.5f) * 2.0f;  // 0..1 over 50%-100%
+                    float desat = desatT * desatT * (3.0f - 2.0f * desatT)
+                                  * epm;  // scale by pull strength
                     for (int dy = 0; dy < 2; ++dy)
                         for (int dx = 0; dx < 2; ++dx) {
                             float black = params.blackAt(ax + dx, ay + dy);
                             float signal = dst(px + dx, py + dy) - black;
-                            dst(px + dx, py + dy) = signal * scale + black;
+                            float scaled = signal * scale;
+                            if (desat > 0.0f) {
+                                // Neutral raw value: compressed luminance
+                                // divided by this channel's WB multiplier
+                                float wb = params.whiteMultAt(ax + dx, ay + dy);
+                                float neutral = L_final / wb;
+                                scaled = scaled + (neutral - scaled) * desat;
+                            }
+                            dst(px + dx, py + dy) = scaled + black;
                         }
                     ++compressedBlocks;
                 }
