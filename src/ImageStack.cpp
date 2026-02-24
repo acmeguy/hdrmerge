@@ -2002,31 +2002,37 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
             double v;
             if (totalWeight > 0.0) {
                 v = weightedSum / totalWeight;
-                // Highlight radiance compression: Reinhard soft clamp.
-                // Maps [refLevel, inf) into [refLevel, refLevel*(1+1/s)]
-                // where s = pull * mask.  With pull=0.8, mask=1.0 the
-                // asymptote is 2.25x refLevel (~1.2 stops), well within
-                // SDR range and Lightroom's highlight slider.
+                // Highlight radiance compression: tight Reinhard clamp.
+                // headroom = (1-s)/s controls ceiling above refLevel.
+                // pull=0.8, mask=1.0 → headroom=0.25 → ceiling 1.25x ref
+                // (only ~0.3 stops above threshold — fully SDR).
                 if (hlMask > 0.0f) {
                     double refLevel = hlThreshold * satThreshPerCh[ch];
                     if (v > refLevel && refLevel > 0.0) {
                         double s = static_cast<double>(highlightPull) * hlMask;
+                        double headroom = (1.0 - s) / std::max(s, 0.01);
                         double excess = (v - refLevel) / refLevel;
-                        double compressed = excess / (1.0 + s * excess);
+                        double compressed = headroom * excess / (headroom + excess);
                         v = refLevel * (1.0 + compressed);
                     }
                 }
             } else {
                 // All exposures saturated or unavailable — use darkest image.
-                // Using the darkest image (imageMax) ensures the response function
-                // slope is consistent with the merge path, and the radiance for
-                // near-clipped pixels is as high as possible. For truly clipped
-                // pixels, the high radiance normalizes to near-white, allowing
-                // the DNG processor's highlight recovery to handle it correctly.
                 if (images[imageMax].contains(x, y)) {
                     v = images[imageMax].exposureAt(x, y);
                 } else {
                     v = 0.0;
+                }
+                // Apply same compression to fallback pixels in highlight regions.
+                if (hlMask > 0.0f && v > 0.0) {
+                    double refLevel = hlThreshold * satThreshPerCh[ch];
+                    if (v > refLevel && refLevel > 0.0) {
+                        double s = static_cast<double>(highlightPull) * hlMask;
+                        double headroom = (1.0 - s) / std::max(s, 0.01);
+                        double excess = (v - refLevel) / refLevel;
+                        double compressed = headroom * excess / (headroom + excess);
+                        v = refLevel * (1.0 + compressed);
+                    }
                 }
             }
 
