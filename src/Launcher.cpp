@@ -566,6 +566,58 @@ void Launcher::parseCommandLine() {
                     cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
                 }
             }
+        } else if (string("--bilateral-range-sigma") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    float val = stof(argv[i]);
+                    if (val >= 0.1f && val <= 2.0f) {
+                        saveOptions.bilateralRangeSigma = val;
+                    } else {
+                        cerr << tr("--bilateral-range-sigma must be between 0.1 and 2.0.") << endl;
+                    }
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
+        } else if (string("--highlight-mask-blur") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    int val = stoi(argv[i]);
+                    if (val >= 0 && val <= 30) {
+                        saveOptions.highlightMaskBlur = val;
+                    } else {
+                        cerr << tr("--highlight-mask-blur must be between 0 and 30.") << endl;
+                    }
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
+        } else if (string("--highlight-scale-blur") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    int val = stoi(argv[i]);
+                    if (val >= 0 && val <= 30) {
+                        saveOptions.highlightScaleBlur = val;
+                    } else {
+                        cerr << tr("--highlight-scale-blur must be between 0 and 30.") << endl;
+                    }
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
+        } else if (string("--highlight-boost-cap") == argv[i]) {
+            if (++i < argc) {
+                try {
+                    float val = stof(argv[i]);
+                    if (val >= 0.0f && val <= 16.0f) {
+                        saveOptions.highlightBoostCap = val;
+                    } else {
+                        cerr << tr("--highlight-boost-cap must be between 0 and 16.") << endl;
+                    }
+                } catch (std::invalid_argument & e) {
+                    cerr << tr("Invalid %1 parameter, using default.").arg(argv[i - 1]) << endl;
+                }
+            }
         } else if (string("-O") == argv[i] || string("--output-dir") == argv[i]) {
             if (++i < argc) {
                 saveOptions.outputDir = QString::fromLocal8Bit(argv[i]);

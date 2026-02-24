@@ -69,12 +69,18 @@ struct SaveOptions {
     float highlightPull;
     float highlightRolloff;
     float highlightKnee;
+    float bilateralRangeSigma;
+    int highlightMaskBlur;
+    int highlightScaleBlur;
+    float highlightBoostCap;
     SaveOptions() : bps(24), previewSize(0), saveMask(false), featherRadius(3),
         compressionLevel(6), deghostSigma(0.0f), deghostMode(DeghostMode::Robust),
         deghostIterations(1), clipPercentile(99.9),
         evShift(0.0),
         autoCurves(false), resizeLong(0), subPixelAlign(false),
-        highlightPull(0.0f), highlightRolloff(0.9f), highlightKnee(2.0f) {}
+        highlightPull(0.0f), highlightRolloff(0.9f), highlightKnee(2.0f),
+        bilateralRangeSigma(0.5f), highlightMaskBlur(10),
+        highlightScaleBlur(3), highlightBoostCap(4.0f) {}
 };
 
 } // namespace hdrmerge

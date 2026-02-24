@@ -208,7 +208,11 @@ double ImageIO::save(const SaveOptions & options, ProgressIndicator & progress) 
                                              options.subPixelAlign,
                                              options.highlightPull,
                                              options.highlightRolloff,
-                                             options.highlightKnee);
+                                             options.highlightKnee,
+                                             options.bilateralRangeSigma,
+                                             options.highlightMaskBlur,
+                                             options.highlightScaleBlur,
+                                             options.highlightBoostCap);
 
     if (options.resizeLong > 0) {
         progress.advance(20, "Resizing image");
