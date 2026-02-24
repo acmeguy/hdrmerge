@@ -64,7 +64,8 @@ public:
                            double clipPercentile = 99.9,
                            bool subPixelAlign = false,
                            float highlightPull = 0.0f,
-                           float highlightRolloff = 0.9f) const;
+                           float highlightRolloff = 0.9f,
+                           float highlightKnee = 2.0f) const;
 
     size_t size() const { return images.size(); }
 

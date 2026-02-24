@@ -1378,7 +1378,7 @@ static inline double interpolateCFA(const Image & img, int x, int y,
 }
 
 
-ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, DeghostMode deghostMode, int deghostIterations, double clipPercentile, bool subPixelAlign, float highlightPull, float highlightRolloff) const {
+ComposeResult ImageStack::compose(const RawParameters & params, int featherRadius, float deghostSigma, DeghostMode deghostMode, int deghostIterations, double clipPercentile, bool subPixelAlign, float highlightPull, float highlightRolloff, float highlightKnee) const {
     int imageMax = images.size() - 1;
     BoxBlur map(fattenMask(mask, featherRadius));
     measureTime("Blur", [&] () {
@@ -2183,7 +2183,8 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
 
         if (sdrCeiling < clampMax * avgWBMul && sdrCeiling > 0.0f) {
             Log::debug("Bilateral highlight compression: sdrCeiling=", sdrCeiling,
-                       " clampMax=", clampMax, " avgWBMul=", avgWBMul);
+                       " clampMax=", clampMax, " avgWBMul=", avgWBMul,
+                       " knee=", highlightKnee);
 
             // Step A: Half-resolution log-luminance map from 2x2 Bayer blocks
             const int bw = static_cast<int>(params.width) / 2;
@@ -2268,10 +2269,38 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
                 }
             }
 
+            // Soften bilateral edges: small box blur on logBase to smooth
+            // sharp transitions at window boundaries (3x3 in half-res ≈ 6px)
+            {
+                Array2D<float> tmp(bw, bh);
+                #pragma omp parallel for schedule(dynamic, 16)
+                for (int by = 0; by < bh; ++by) {
+                    for (int bx = 0; bx < bw; ++bx) {
+                        float sum = 0.0f;
+                        int count = 0;
+                        for (int ky = -1; ky <= 1; ++ky) {
+                            int ny = by + ky;
+                            if (ny < 0 || ny >= bh) continue;
+                            for (int kx = -1; kx <= 1; ++kx) {
+                                int nx = bx + kx;
+                                if (nx < 0 || nx >= bw) continue;
+                                sum += logBase(nx, ny);
+                                ++count;
+                            }
+                        }
+                        tmp(bx, by) = sum / count;
+                    }
+                }
+                // Blend: 70% bilateral, 30% blurred to soften edges
+                #pragma omp parallel for
+                for (int i = 0; i < bw * bh; ++i)
+                    logBase[i] = logBase[i] * 0.7f + tmp[i] * 0.3f;
+            }
+
             // Step C: Compress base layer + reconstruct
-            // Reinhard extended: L_compressed = L * (1 + L/Lw²) / (1 + L)
-            // where Lw = sdrCeiling (the SDR white point in signal space)
-            const float Lw = sdrCeiling;
+            // Reinhard extended: L_compressed = L * (1 + L/Lw²) / (1 + L/Lw)
+            // highlightKnee scales Lw for gentler compression (higher = gentler)
+            const float Lw = sdrCeiling * highlightKnee;
             const float Lw2 = Lw * Lw;
             long long compressedBlocks = 0;
 
@@ -2297,7 +2326,7 @@ ComposeResult ImageStack::compose(const RawParameters & params, int featherRadiu
 
                     // Compute scale factor from base layer compression
                     float scale = (L > 0.01f) ? L_final / L : 1.0f;
-                    if (scale < 0.01f) scale = 0.01f;
+                    if (scale < 0.1f) scale = 0.1f;
                     if (scale > 1.0f) scale = 1.0f;
 
                     // Apply scale + highlight desaturation to all 4 pixels.
